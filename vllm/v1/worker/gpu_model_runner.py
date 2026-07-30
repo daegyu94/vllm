@@ -3790,12 +3790,53 @@ class GPUModelRunner(
         Returns:
             Model output tensor
         """
+        if envs.VLLM_SYNTHETIC_KV:
+            return self._synthetic_kv_forward(input_ids, inputs_embeds)
         return self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             **model_kwargs,
+        )
+
+    def _synthetic_kv_forward(
+        self,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run KV connector hooks without executing the transformer."""
+        if has_kv_transfer_group():
+            from vllm.model_executor.layers.attention.attention import (
+                get_attention_context,
+            )
+
+            connector = get_kv_transfer_group()
+            for group in self.kv_cache_config.kv_cache_groups:
+                for layer_name in group.layer_names:
+                    attn_metadata, _, kv_cache, _ = get_attention_context(layer_name)
+                    if attn_metadata is None:
+                        continue
+                    connector.wait_for_layer_load(layer_name)
+                    connector.save_kv_layer(layer_name, kv_cache, attn_metadata)
+
+        if input_ids is not None:
+            num_tokens = input_ids.shape[0]
+        else:
+            assert inputs_embeds is not None
+            num_tokens = inputs_embeds.shape[0]
+        return torch.zeros(
+            (num_tokens, self.model_config.get_hidden_size()),
+            dtype=self.model_config.dtype,
+            device=self.device,
+        )
+
+    def _synthetic_logits(self, num_tokens: int) -> torch.Tensor:
+        """Return deterministic logits without executing the language head."""
+        return torch.zeros(
+            (num_tokens, self.model_config.get_vocab_size()),
+            dtype=torch.float32,
+            device=self.device,
         )
 
     @staticmethod
@@ -4364,7 +4405,11 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                logits = (
+                    self._synthetic_logits(sample_hidden_states.shape[0])
+                    if envs.VLLM_SYNTHETIC_KV
+                    else self.model.compute_logits(sample_hidden_states)
+                )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4383,7 +4428,11 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                    logits = (
+                        self._synthetic_logits(sample_hidden_states.shape[0])
+                        if envs.VLLM_SYNTHETIC_KV
+                        else self.model.compute_logits(sample_hidden_states)
+                    )
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -5709,6 +5758,14 @@ class GPUModelRunner(
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
         """
+        if envs.VLLM_SYNTHETIC_KV:
+            hidden_states = torch.zeros(
+                (num_tokens, self.model_config.get_hidden_size()),
+                dtype=self.model_config.dtype,
+                device=self.device,
+            )
+            return hidden_states, hidden_states
+
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
             # The current dummy run only covers LM execution, so we can skip it.

@@ -160,6 +160,7 @@ if TYPE_CHECKING:
     VLLM_DP_MASTER_IP: str = ""
     VLLM_DP_MASTER_PORT: int = 0
     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
+    VLLM_SYNTHETIC_KV: bool = False
     VLLM_RAY_DP_PACK_STRATEGY: Literal["strict", "fill", "span"] = "strict"
     VLLM_RAY_DP_PLACEMENT_NODE_IPS: str = ""
     VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY: str = ""
@@ -1332,6 +1333,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_RANDOMIZE_DP_DUMMY_INPUTS": lambda: (
         os.environ.get("VLLM_RANDOMIZE_DP_DUMMY_INPUTS", "0") == "1"
     ),
+    # Skip transformer forward while preserving KV connector load/save hooks.
+    "VLLM_SYNTHETIC_KV": lambda: os.environ.get("VLLM_SYNTHETIC_KV", "0") == "1",
     # Strategy to pack the data parallel ranks for Ray.
     # Available options:
     # - "fill":

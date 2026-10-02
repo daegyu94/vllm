@@ -92,8 +92,11 @@ def main():
         threading.Event(),
         replicate_config=config,
         save_request_deltas=args.delta,
-        record_operation=lambda op, duration, keys, **kw: events.append(
-            dict(op=op, duration_seconds=duration, keys=keys, **kw)
+        record_operation=lambda operation,
+        duration_seconds,
+        num_keys,
+        **kw: events.append(
+            dict(op=operation, duration_seconds=duration_seconds, keys=num_keys, **kw)
         ),
     )
     runs = []

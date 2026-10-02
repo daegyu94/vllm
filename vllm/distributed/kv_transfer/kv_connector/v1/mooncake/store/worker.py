@@ -1016,6 +1016,10 @@ class MooncakeStoreWorker:
             store_config.protocol,
             store_config.device_name,
             store_config.master_server_address,
+            enable_ssd_offload=store_config.enable_offload,
+            ssd_offload_path=os.environ.get(
+                "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", ""
+            ),
         )
         if ret != 0:
             msg = "Initialize MooncakeDistributedStore failed."
@@ -1025,6 +1029,16 @@ class MooncakeStoreWorker:
         preferred_segment = rdma_utils.get_configured_preferred_segment(extra_config)
         self.preferred_segment = preferred_segment
         self.store_replicate_config = ReplicateConfig()
+        self.store_replicate_config.replica_num = int(
+            extra_config.get("replica_num", 1)
+        )
+        dfs_replica_num = int(extra_config.get("dfs_replica_num", 0))
+        if dfs_replica_num:
+            if not hasattr(self.store_replicate_config, "dfs_replica_num"):
+                raise RuntimeError(
+                    "Installed Mooncake does not support dfs_replica_num"
+                )
+            self.store_replicate_config.dfs_replica_num = dfs_replica_num
         if preferred_segment is not None:
             self.store_replicate_config.preferred_segment = preferred_segment
 

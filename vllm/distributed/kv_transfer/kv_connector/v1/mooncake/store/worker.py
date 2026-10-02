@@ -556,7 +556,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     starts.append(start)
                     ends.append(end)
                     keys.append(key.to_string())
-                    block_hashes.append(BlockHash(bytes.fromhex(key.chunk_hash)))
+                    if self.enable_kv_event:
+                        block_hashes.append(BlockHash(bytes.fromhex(key.chunk_hash)))
                     group_indices.append(g_idx)
 
             # Apply put_step striding for TP
@@ -598,7 +599,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
             starts = [starts[i] for i in missing_indices]
             ends = [ends[i] for i in missing_indices]
             keys = [keys[i] for i in missing_indices]
-            block_hashes = [block_hashes[i] for i in missing_indices]
+            if self.enable_kv_event:
+                block_hashes = [block_hashes[i] for i in missing_indices]
             group_indices = [group_indices[i] for i in missing_indices]
 
             logger.debug(
@@ -613,7 +615,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
             stored_events: list[BlockStored] = []
             # parent_block_hash chains live within a group, not across.
             prev_key_per_group: dict[int, Any] = {}
-            new_block_hashes = [maybe_convert_block_hash(bh) for bh in block_hashes]
+            new_block_hashes = (
+                [maybe_convert_block_hash(bh) for bh in block_hashes]
+                if self.enable_kv_event
+                else []
+            )
 
             for idx, (s, e, g_idx) in enumerate(
                 zip(starts, ends, group_indices, strict=True)
@@ -1017,9 +1023,7 @@ class MooncakeStoreWorker:
             store_config.device_name,
             store_config.master_server_address,
             enable_ssd_offload=store_config.enable_offload,
-            ssd_offload_path=os.environ.get(
-                "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", ""
-            ),
+            ssd_offload_path=os.environ.get("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", ""),
         )
         if ret != 0:
             msg = "Initialize MooncakeDistributedStore failed."

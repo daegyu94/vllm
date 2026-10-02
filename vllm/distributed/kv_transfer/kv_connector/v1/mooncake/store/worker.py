@@ -450,6 +450,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         enable_kv_event: bool = False,
         replicate_config: Any = None,
         record_operation: Callable[..., None] | None = None,
+        save_request_deltas: bool = False,
     ):
         super().__init__(
             store,
@@ -465,6 +466,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.kv_role = kv_role
         self.stored_requests: defaultdict[str, int] = defaultdict(int)
         self.enable_kv_event = enable_kv_event
+        self.save_request_deltas = save_request_deltas and not enable_kv_event
+        self._saved_request_keys: dict[str, set[str]] = {}
         # Caller always passes a non-None ReplicateConfig — see
         # MooncakeStoreWorker.__init__ where store_replicate_config is built.
         self.replicate_config = replicate_config
@@ -487,6 +490,18 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if req_id in self.stored_requests:
                 del self.stored_requests[req_id]
             self._skip_store_requests.discard(req_id)
+            self._saved_request_keys.pop(req_id, None)
+
+    def clear_saved_request_keys(self):
+        with self.done_task_lock:
+            self._saved_request_keys.clear()
+
+    def _remember_saved_keys(self, req_id: str, keys: list[str]):
+        if not self.save_request_deltas:
+            return
+        with self.done_task_lock:
+            if req_id in self.stored_requests:
+                self._saved_request_keys.setdefault(req_id, set()).update(keys)
 
     def _should_skip_request(self, req_id: str) -> bool:
         with self.done_task_lock:
@@ -568,6 +583,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
             block_hashes = block_hashes[sl]
             group_indices = group_indices[sl]
 
+            if self.save_request_deltas:
+                with self.done_task_lock:
+                    known = self._saved_request_keys.get(req_id, set())
+                    fresh = [i for i, key in enumerate(keys) if key not in known]
+                starts = [starts[i] for i in fresh]
+                ends = [ends[i] for i in fresh]
+                keys = [keys[i] for i in fresh]
+                group_indices = [group_indices[i] for i in fresh]
+
             if not keys:
                 return
 
@@ -588,6 +612,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 "save_exists",
                 save_exists_start,
                 len(keys),
+            )
+            self._remember_saved_keys(
+                req_id, [key for key, state in zip(keys, exists_states) if state == 1]
             )
             missing_indices = [
                 i for i, exists in enumerate(exists_states) if exists != 1
@@ -659,6 +686,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     addrs,
                     sizes,
                     self.replicate_config,
+                )
+                self._remember_saved_keys(
+                    req_id, [key for key, result in zip(keys, res) if result >= 0]
                 )
                 failed = [i for i, v in enumerate(res) if v < 0]
                 self._record_operation(
@@ -959,6 +989,13 @@ class MooncakeStoreWorker:
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "load_async", True
         )
+        self.save_request_deltas = (
+            vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+                "save_request_deltas", False
+            )
+        )
+        if not isinstance(self.save_request_deltas, bool):
+            raise ValueError("Mooncake save_request_deltas must be a boolean")
         self.cache_config = vllm_config.cache_config
         self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
@@ -1235,6 +1272,7 @@ class MooncakeStoreWorker:
                 self.enable_kv_events,
                 self.store_replicate_config,
                 record_operation=self._record_kv_connector_operation,
+                save_request_deltas=self.save_request_deltas,
             )
             self.kv_send_thread.start()
 
@@ -1542,6 +1580,7 @@ class LookupKeyServer:
                         # flat key space, clearing every (group_id, hash) entry.
                         if self.store_worker.kv_send_thread is not None:
                             self.store_worker.kv_send_thread.request_queue.join()
+                            self.store_worker.kv_send_thread.clear_saved_request_keys()
                         self.store_worker.store.remove_all(force=True)
                         logger.info("Mooncake store reset via remove_all succeeded.")
                         self.socket.send(RESP_OK)

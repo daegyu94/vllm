@@ -1238,6 +1238,7 @@ def _make_bare_worker(
     worker.tp_rank = 0
     worker.put_step = 1
     worker.enable_kv_events = False
+    worker.save_request_deltas = False
     worker.kv_send_thread = None
     worker.kv_recv_thread = None
     worker.tp_size = 1
@@ -1781,3 +1782,46 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+def test_request_deltas_skip_confirmed_keys_but_retry_failed_puts():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = [[0, -5], [0]]
+    thread = _make_store_sending_thread(store)
+    thread.save_request_deltas = True
+    req = _make_store_req("delta", [b"a0", b"a1"])
+    for _ in range(3):
+        thread.add_stored_request("delta")
+        thread._handle_request(req)
+    assert [len(call.args[0]) for call in store.batch_is_exist.call_args_list] == [2, 1]
+    assert store.batch_put_from_multi_buffers.call_count == 2
+    assert thread.stored_requests["delta"] == 0
+    assert len(thread._saved_request_keys["delta"]) == 2
+    thread.clear_saved_request_keys()
+    assert not thread._saved_request_keys
+
+
+def test_request_delta_scope_ends_at_request_completion_and_reset():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [1] * len(keys)
+    thread = _make_store_sending_thread(store)
+    thread.save_request_deltas = True
+
+    def save(req_id):
+        thread.add_stored_request(req_id)
+        thread._handle_request(_make_store_req(req_id, [b"a0", b"a1"]))
+
+    save("first")
+    save("first")
+    assert store.batch_is_exist.call_count == 1
+    save("second")
+    assert store.batch_is_exist.call_count == 2
+    thread.delete_finished_stored_request("first")
+    assert "first" not in thread._saved_request_keys
+    save("first")
+    assert store.batch_is_exist.call_count == 3
+    thread.clear_saved_request_keys()
+    save("second")
+    assert store.batch_is_exist.call_count == 4
+    store.batch_put_from_multi_buffers.assert_not_called()

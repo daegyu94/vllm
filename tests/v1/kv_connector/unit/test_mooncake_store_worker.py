@@ -1238,6 +1238,7 @@ def _make_bare_worker(
     worker.tp_rank = 0
     worker.put_step = 1
     worker.enable_kv_events = False
+    worker.save_precheck = True
     worker.kv_send_thread = None
     worker.kv_recv_thread = None
     worker.tp_size = 1
@@ -1781,3 +1782,53 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+@pytest.mark.parametrize(
+    "precheck,events,exists,put_keys",
+    [
+        (True, False, [1, 0], 1),
+        (False, False, [1, 0], 2),
+        (False, True, [1, 1], 0),
+    ],
+)
+def test_save_precheck_preserves_default_filter_and_event_semantics(
+    precheck, events, exists, put_keys
+):
+    store = MagicMock()
+    store.batch_is_exist.return_value = exists
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *_: [0] * len(keys)
+    thread = worker.KVCacheStoreSendingThread(
+        store,
+        _default_send_coord(),
+        _make_store_sending_thread(store).token_databases,
+        16,
+        0,
+        1,
+        "kv_producer",
+        threading.Event(),
+        enable_kv_event=events,
+        save_precheck=precheck,
+    )
+    thread.request_queue.task_done = MagicMock()
+    thread.add_stored_request("precheck")
+    thread._handle_request(_make_store_req("precheck", [b"a0", b"a1"]))
+    assert store.batch_is_exist.call_count == int(precheck or events)
+    if put_keys:
+        assert len(store.batch_put_from_multi_buffers.call_args.args[0]) == put_keys
+    else:
+        store.batch_put_from_multi_buffers.assert_not_called()
+    assert thread.stored_requests["precheck"] == 0
+    thread.request_queue.task_done.assert_called_once()
+
+
+def test_save_without_precheck_releases_pin_on_native_failure():
+    store = MagicMock()
+    store.batch_put_from_multi_buffers.side_effect = RuntimeError("native failure")
+    thread = _make_store_sending_thread(store)
+    thread.save_precheck = False
+    thread.add_stored_request("failure")
+    thread._handle_request(_make_store_req("failure", [b"a0", b"a1"]))
+    store.batch_is_exist.assert_not_called()
+    assert thread.stored_requests["failure"] == 0
+    thread.request_queue.task_done.assert_called_once()

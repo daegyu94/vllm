@@ -450,6 +450,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         enable_kv_event: bool = False,
         replicate_config: Any = None,
         record_operation: Callable[..., None] | None = None,
+        save_precheck: bool = True,
     ):
         super().__init__(
             store,
@@ -465,6 +466,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.kv_role = kv_role
         self.stored_requests: defaultdict[str, int] = defaultdict(int)
         self.enable_kv_event = enable_kv_event
+        # Events describe newly stored blocks, which requires the precheck.
+        self.save_precheck = save_precheck or enable_kv_event
         # Caller always passes a non-None ReplicateConfig — see
         # MooncakeStoreWorker.__init__ where store_replicate_config is built.
         self.replicate_config = replicate_config
@@ -571,28 +574,30 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if not keys:
                 return
 
-            # Check which blocks already exist (dedup)
-            save_exists_start = time.perf_counter()
-            try:
-                exists_states = self.store.batch_is_exist(keys)
-            except Exception:
+            # Native Mooncake PUT is idempotent; fresh-key workloads may
+            # opt out of this extra RPC. Preserve filtering by default.
+            missing_indices = list(range(len(keys)))
+            if self.save_precheck:
+                save_exists_start = time.perf_counter()
+                try:
+                    exists_states = self.store.batch_is_exist(keys)
+                except Exception:
+                    self._record_operation(
+                        "save_exists",
+                        save_exists_start,
+                        len(keys),
+                        status="error",
+                        num_failed_keys=len(keys),
+                    )
+                    raise
                 self._record_operation(
                     "save_exists",
                     save_exists_start,
                     len(keys),
-                    status="error",
-                    num_failed_keys=len(keys),
                 )
-                raise
-            self._record_operation(
-                "save_exists",
-                save_exists_start,
-                len(keys),
-            )
-            missing_indices = [
-                i for i, exists in enumerate(exists_states) if exists != 1
-            ]
-
+                missing_indices = [
+                    i for i, exists in enumerate(exists_states) if exists != 1
+                ]
             if not missing_indices:
                 return
 
@@ -959,6 +964,13 @@ class MooncakeStoreWorker:
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "load_async", True
         )
+        self.save_precheck = (
+            vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+                "save_precheck", True
+            )
+        )
+        if not isinstance(self.save_precheck, bool):
+            raise ValueError("Mooncake save_precheck must be a boolean")
         self.cache_config = vllm_config.cache_config
         self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
@@ -1235,6 +1247,7 @@ class MooncakeStoreWorker:
                 self.enable_kv_events,
                 self.store_replicate_config,
                 record_operation=self._record_kv_connector_operation,
+                save_precheck=self.save_precheck,
             )
             self.kv_send_thread.start()
 

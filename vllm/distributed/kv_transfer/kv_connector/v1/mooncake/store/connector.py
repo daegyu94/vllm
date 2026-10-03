@@ -194,6 +194,11 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         else:
             self.connector_worker = MooncakeStoreWorker(vllm_config, kv_cache_config)
 
+    def transition_policy_region(self, policy_identity: str) -> bool:
+        if self.connector_worker is None:
+            raise RuntimeError("policy transition requires the worker connector")
+        return self.connector_worker.transition_policy_region(policy_identity)
+
     def shutdown(self):
         """Release connector resources on teardown.
 

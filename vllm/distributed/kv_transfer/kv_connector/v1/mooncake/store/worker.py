@@ -1511,7 +1511,37 @@ class MooncakeStoreWorker:
         # store so failures cannot leak a partially initialized store handle.
         self._mem_pool = self._create_mem_pool(extra_config, model_config)
 
-        self.store = MooncakeDistributedStore()
+        self.store: Any
+        if extra_config.get("policy_regions", False):
+            from .policy_region import PolicyRegionStore
+
+            run_id = extra_config.get("policy_region_run_id")
+            if not isinstance(run_id, str) or not run_id:
+                raise ValueError(
+                    "policy_regions requires a unique policy_region_run_id"
+                )
+            if (
+                self.tp_size != 1
+                or self.pp_size != 1
+                or self.pcp_size != 1
+                or self.dcp_size != 1
+                or parallel_config.data_parallel_size != 1
+                or str(extra_config.get("enable_group_semantics", False)).lower()
+                == "true"
+                or extra_config.get("preferred_segment")
+                or envs.VLLM_MOONCAKE_STORE_TIER_LOG
+            ):
+                raise ValueError(
+                    "policy regions PoC supports single-TP/DP/PP/CP replicas "
+                    "without groups/tier logging"
+                )
+            self.store = PolicyRegionStore(
+                run_id + "/initial",
+                slots=extra_config.get("policy_region_slots", 64),
+                cache_keys=extra_config.get("policy_region_cache_keys", 4096),
+            )
+        else:
+            self.store = MooncakeDistributedStore()
         local_ip = get_ip()
         local_hostname = rdma_utils.get_requester_local_hostname(local_ip)
         setup_mooncake_store(self.store, store_config, local_hostname)
@@ -2378,6 +2408,18 @@ class MooncakeStoreWorker:
     @property
     def group_tp_replication_factors(self) -> tuple[int, ...]:
         return self._group_tp_replication_factors
+
+    def transition_policy_region(self, policy_identity: str) -> bool:
+        from .policy_region import PolicyRegionStore
+
+        if not isinstance(self.store, PolicyRegionStore):
+            raise RuntimeError("policy_regions is not enabled")
+        # All TP ranks must enter this hook with generation paused. Joining both
+        # queues prevents old jobs from acquiring the new policy identity.
+        for thread in (self.kv_send_thread, *self.kv_recv_threads):
+            if thread is not None:
+                thread.request_queue.join()
+        return self.store.transition_policy(policy_identity)
 
     def close(self) -> None:
         """Release the MooncakeDistributedStore handle on teardown.

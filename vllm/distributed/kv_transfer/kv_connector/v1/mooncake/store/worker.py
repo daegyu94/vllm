@@ -126,6 +126,31 @@ def _replicate_config_supports_group_ids(
     return hasattr(replicate_config, "group_ids")
 
 
+def _configure_dfs_replicas(
+    config: MooncakeStoreConfig,
+    replicate_config: Any,
+    extra_config: dict[str, Any],
+) -> None:
+    if not config.enable_dfs:
+        if extra_config.get("dfs_replica_num", 0) != 0:
+            raise ValueError("dfs_replica_num requires enable_dfs=True")
+        return
+    if not hasattr(replicate_config, "dfs_replica_num"):
+        raise RuntimeError("Installed Mooncake does not support dfs_replica_num")
+    replica_num = extra_config.get("replica_num", 1)
+    dfs_replica_num = extra_config.get("dfs_replica_num", 1)
+    for name, value in (
+        ("replica_num", replica_num),
+        ("dfs_replica_num", dfs_replica_num),
+    ):
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{name} must be a positive integer when DFS is enabled")
+    if dfs_replica_num != 1:
+        raise ValueError("Mooncake DFS requires dfs_replica_num=1")
+    replicate_config.replica_num = replica_num
+    replicate_config.dfs_replica_num = dfs_replica_num
+
+
 def _make_mooncake_group_id(metadata: KeyMetadata, chunk_hash: str) -> str:
     # Mooncake group ids describe the lifecycle unit. For vLLM, that unit is
     # a prefix chunk, so shard dimensions stay only in the object key.
@@ -1507,6 +1532,8 @@ class MooncakeStoreWorker:
 
         # Initialize MooncakeDistributedStore with its own TransferEngine
         store_config = MooncakeStoreConfig.load_from_config()
+        self.store_replicate_config = ReplicateConfig()
+        _configure_dfs_replicas(store_config, self.store_replicate_config, extra_config)
         # Validate and create the custom memory pool before initializing the
         # store so failures cannot leak a partially initialized store handle.
         self._mem_pool = self._create_mem_pool(extra_config, model_config)
@@ -1518,7 +1545,6 @@ class MooncakeStoreWorker:
 
         preferred_segment = rdma_utils.get_configured_preferred_segment(extra_config)
         self.preferred_segment = preferred_segment
-        self.store_replicate_config = ReplicateConfig()
         self.enable_group_semantics = (
             str(extra_config.get("enable_group_semantics", "False")).strip().lower()
             == "true"
@@ -1571,6 +1597,11 @@ class MooncakeStoreWorker:
             if store_config.enable_offload
             else None
         )
+        if store_config.enable_dfs:
+            self.disk_offload_buffer_budget_bytes = min(
+                self.disk_offload_buffer_budget_bytes or store_config.local_buffer_size,
+                store_config.local_buffer_size,
+            )
 
         # Start lookup server on rank 0 for scheduler-side prefix queries
         self.lookup_server: LookupKeyServer | None = None

@@ -60,6 +60,59 @@ _TP_SHARED_NAMESPACE = "@store_tp:4@store_pp:1@store_format:tp_shared_lbhnc"
 _TP_SHARED_LBNHC_NAMESPACE = "@store_tp:4@store_pp:1@store_format:tp_shared_lbnhc"
 
 
+@pytest.mark.parametrize(
+    "result,expected",
+    [
+        (-1, worker.RESP_ERR),
+        (-200, worker.RESP_ERR),
+        (0, worker.RESP_OK),
+        (7, worker.RESP_OK),
+        (RuntimeError("master unavailable"), worker.RESP_ERR),
+    ],
+)
+@pytest.mark.parametrize("has_send_thread", [False, True])
+def test_lookup_server_reset_reports_store_result(
+    monkeypatch, result, expected, has_send_thread, caplog
+):
+    events = []
+    store = MagicMock()
+
+    def remove_all(*, force):
+        assert force is True
+        events.append("remove")
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    store.remove_all.side_effect = remove_all
+    send_thread = MagicMock() if has_send_thread else None
+    if send_thread is not None:
+        send_thread.request_queue.join.side_effect = lambda: events.append("drain")
+    server_worker = SimpleNamespace(store=store, kv_send_thread=send_thread)
+    socket = MagicMock()
+    monkeypatch.setattr(worker.zmq, "Context", MagicMock())
+    monkeypatch.setattr(worker, "get_zmq_rpc_path_lookup", lambda _: "inproc://reset")
+    monkeypatch.setattr(worker, "make_zmq_socket", lambda *args, **kwargs: socket)
+    with patch.object(worker.threading, "Thread") as thread:
+        server = worker.LookupKeyServer(server_worker, MagicMock())
+        process_request = thread.call_args.kwargs["target"]
+    # Two requests prove a negative result does not stop the REP server.
+    socket.recv_multipart.return_value = [worker.RESET_MSG]
+
+    def send(response):
+        if socket.send.call_count == 2:
+            server.running = False
+
+    socket.send.side_effect = send
+    with caplog.at_level(logging.INFO):
+        process_request()
+    assert [call.args[0] for call in socket.send.call_args_list] == [expected] * 2
+    assert events == (["drain", "remove"] if has_send_thread else ["remove"]) * 2
+    assert ("reset via remove_all succeeded" in caplog.text) is (
+        expected == worker.RESP_OK
+    )
+
+
 def _tp_shared_prefix(tp_rank: int) -> str:
     return (
         f"test-model{_TP_SHARED_NAMESPACE}@tp_rank:{tp_rank}"

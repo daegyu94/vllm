@@ -276,12 +276,14 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 - `load_async` (bool): Enable asynchronous loading for better compute-I/O overlap. Default: `true`.
 - `lookup_async` (bool): Run the external prefix-cache lookup on a background thread so it never blocks the scheduler step. The request is held until the in-flight lookup completes, then resumed on a later step. Default: `false`.
 - `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.
-- `cache_prefix` (str): Namespace prepended to every store key. Lets separate deployments share one Mooncake master without polluting each other — instances configured with different prefixes never see each other's cached blocks, even for identical prompts. All instances that should share a prefix cache must use the same value. Default: `""` (no prefix; keys are byte-identical to the unprefixed format).
+- `cache_prefix` (str): Namespace prepended to every store key. Use distinct prefixes for deployments with different weights, and the same prefix only for instances sharing one policy. A nonempty prefix also scopes connector resets to that namespace. `@` is reserved as the key delimiter and cannot appear in a prefix. Default: `""` (unprefixed keys and legacy tenant-wide reset).
 - `save_decode_cache` (bool): Enable offloading decode tokens' KV cache. A `kv_consumer` does not save during prefill; when decode starts, it fills any missing block-aligned prompt prefix before appending completed decode blocks. Default: `false`.
 - `store_tp_size` (int): Common Store TP for endpoints with different local TP sizes. It supports LBHNC and LBNHC local KV caches, with `store_tp_size >= local_tp_size` and `store_tp_size % local_tp_size == 0`. The current topology is one full-attention cache group, PCP/DCP disabled, and cross-layer blocks disabled. For GQA and MHA, the total KV-head count must be divisible by `store_tp_size`. Store shards contain fixed global KV-head ranges in the local layout. Shared endpoints use the same KV cache layout, pipeline-parallel size, and Store TP. The Store namespace includes the layout and PP size. Unsupported configurations use a topology-specific rank-local namespace.
 
 LBHNC/HND is strongly recommended for TP-sharded Store when supported. LBNHC/NHD
 creates many transfer segments and may significantly reduce PUT/GET performance.
+
+Before resetting a shared namespace, pause admission and drain transfers on every replica using that prefix. The rank-0 reset handler drains its local send and receive queues, then removes keys matching the literal prefix followed by `@`. Regex metacharacters in the prefix are escaped. Other namespaces remain available; failed deletion returns a reset failure. A build without `remove_by_regex` fails a prefixed reset and does not fall back to deleting the tenant.
 
 For example, with prefill TP 4, decode TP 2, and eight KV heads, set
 `store_tp_size` to 4 on both instances. Each decode rank reads and writes two

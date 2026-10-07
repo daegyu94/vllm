@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import regex as re
 import torch
 
 from tests.v1.attention.utils import dense_kv_cache_views
@@ -58,6 +59,102 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 
 _TP_SHARED_NAMESPACE = "@store_tp:4@store_pp:1@store_format:tp_shared_lbhnc"
 _TP_SHARED_LBNHC_NAMESPACE = "@store_tp:4@store_pp:1@store_format:tp_shared_lbnhc"
+
+
+def _run_reset_message(monkeypatch, store_worker):
+    socket = MagicMock()
+    monkeypatch.setattr(worker.zmq, "Context", MagicMock())
+    monkeypatch.setattr(worker, "get_zmq_rpc_path_lookup", lambda _: "inproc://reset")
+    monkeypatch.setattr(worker, "make_zmq_socket", lambda *args, **kwargs: socket)
+    with patch.object(worker.threading, "Thread") as thread:
+        server = worker.LookupKeyServer(store_worker, MagicMock())
+        process_request = thread.call_args.kwargs["target"]
+    socket.recv_multipart.return_value = [worker.RESET_MSG]
+    socket.send.side_effect = lambda _: setattr(server, "running", False)
+    process_request()
+    return socket.send.call_args.args[0]
+
+
+@pytest.mark.parametrize("prefix", ["job-a", "job.a+(x)[y]", r"job\a"])
+def test_reset_keeps_other_namespaces(monkeypatch, prefix):
+    own_key = prefix + "@checkpoint@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@hash"
+    foreign_keys = {"other@checkpoint@hash", prefix + "-other@checkpoint@hash"}
+    keys = {own_key, *foreign_keys}
+    events = []
+    w = worker.MooncakeStoreWorker.__new__(worker.MooncakeStoreWorker)
+    w.cache_prefix = prefix
+    w.kv_send_thread = MagicMock()
+    w.kv_send_thread.request_queue.join.side_effect = lambda: events.append("send")
+    w.recv_request_queue = MagicMock()
+    w.recv_request_queue.join.side_effect = lambda: events.append("recv")
+    w.store = MagicMock()
+
+    def remove_by_regex(pattern, *, force):
+        assert force is True
+        events.append("remove")
+        matched = {key for key in keys if re.search(pattern, key)}
+        keys.difference_update(matched)
+        return len(matched)
+
+    def remove_all(*, force):
+        count = len(keys)
+        keys.clear()
+        return count
+
+    w.store.remove_by_regex.side_effect = remove_by_regex
+    w.store.remove_all.side_effect = remove_all
+    assert _run_reset_message(monkeypatch, w) == worker.RESP_OK
+    assert keys == foreign_keys
+    assert events == ["send", "recv", "remove"]
+    w.store.remove_all.assert_not_called()
+
+
+@pytest.mark.parametrize("prefix", ["", "job-a"])
+@pytest.mark.parametrize("result", [-1, -200, 0, 7, RuntimeError("master unavailable")])
+def test_reset_reports_scoped_and_global_failures(monkeypatch, prefix, result):
+    w = worker.MooncakeStoreWorker.__new__(worker.MooncakeStoreWorker)
+    w.cache_prefix = prefix
+    w.kv_send_thread = None
+    w.recv_request_queue = MagicMock()
+    w.store = MagicMock()
+    remove = w.store.remove_by_regex if prefix else w.store.remove_all
+    if isinstance(result, Exception):
+        remove.side_effect = result
+    else:
+        remove.return_value = result
+    expected = (
+        worker.RESP_ERR
+        if isinstance(result, Exception) or result < 0
+        else worker.RESP_OK
+    )
+    assert _run_reset_message(monkeypatch, w) == expected
+    w.recv_request_queue.join.assert_called_once()
+    remove.assert_called_once()
+
+
+def test_unprefixed_reset_retains_legacy_global_scope(monkeypatch):
+    w = worker.MooncakeStoreWorker.__new__(worker.MooncakeStoreWorker)
+    w.cache_prefix = ""
+    w.kv_send_thread = None
+    w.recv_request_queue = MagicMock()
+    w.store = MagicMock()
+    w.store.remove_all.return_value = 3
+    assert _run_reset_message(monkeypatch, w) == worker.RESP_OK
+    w.store.remove_all.assert_called_once_with(force=True)
+    w.store.remove_by_regex.assert_not_called()
+
+
+@pytest.mark.parametrize("prefix", ["job@child", None, 1, False])
+def test_worker_rejects_ambiguous_prefix_before_store_setup(monkeypatch, prefix):
+    store = MagicMock()
+    _install_fake_mooncake(monkeypatch, store)
+    _patch_worker_runtime(monkeypatch)
+    with pytest.raises(ValueError, match="cache_prefix"):
+        worker.MooncakeStoreWorker(
+            _make_vllm_config(extra_config={"cache_prefix": prefix}),
+            _make_kv_cache_config(),
+        )
+    store.setup.assert_not_called()
 
 
 def _tp_shared_prefix(tp_rank: int) -> str:

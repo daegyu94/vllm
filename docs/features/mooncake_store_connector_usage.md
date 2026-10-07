@@ -64,6 +64,10 @@ Create a JSON configuration file (e.g., `mooncake_config.json`):
 - `tenant_id`: Optional Mooncake tenant namespace. Producers and consumers
   that should share store data must use the same tenant id. Default:
   `"default"`.
+- `enable_dfs`: Initialize the client's file-storage layer and request a DFS
+  replica for each KV put. Defaults to `false` and is separate from
+  `enable_offload`, which controls the existing owner SSD tier. Requires a
+  DFS-enabled Mooncake build and the `default` tenant.
 
 Set the config path via environment variable:
 
@@ -72,6 +76,27 @@ export MOONCAKE_CONFIG_PATH=/path/to/mooncake_config.json
 ```
 
 ## Usage
+
+### Distributed File Storage (DFS)
+
+Set `"enable_dfs": true` in the Mooncake JSON configuration. Configure the Master and every reader/writer with the same Mooncake DFS root, backend, shard layout, and alignment, following the [Mooncake DFS deployment guide](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/deployment/mooncake-store-deployment-guide.md). The client is initialized with `enable_ssd_offload=True`. Each put requests one memory replica and one DFS replica by default. A Mooncake build without `ReplicateConfig.dfs_replica_num` is rejected before initializing the Store.
+
+Memory replication can be increased through `kv_connector_extra_config`:
+
+```json
+{
+  "kv_connector": "MooncakeStoreConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "replica_num": 2,
+    "dfs_replica_num": 1
+  }
+}
+```
+
+Mooncake requires `replica_num >= 1` and `dfs_replica_num == 1` for DFS. DFS GET batches use the client's `local_buffer_size` as their staging limit, also respecting the existing SSD limit when `enable_offload` is enabled. Individual keys that exceed the usable staging budget are reported as load failures instead of being submitted as an oversized batch. Concurrent reads share the native buffer and can still exhaust it.
+
+To verify DFS I/O, save KV, drain pending puts, then remove only the memory replicas. Check that the remaining DFS descriptors restore identical data and that the storage backend reports actual reads. A memory cache hit or a successful rollout alone does not verify the DFS path. Use a dedicated Master and DFS root for this verification because a connector reset clears the Store's tenant key space.
 
 ### Single-Node KV Cache Offloading
 

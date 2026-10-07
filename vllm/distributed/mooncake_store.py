@@ -36,8 +36,13 @@ class MooncakeStoreConfig:
     local_buffer_size: int = DEFAULT_LOCAL_BUFFER_SIZE
     enable_offload: bool = False
     tenant_id: str = DEFAULT_TENANT_ID
+    enable_dfs: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.enable_dfs, bool):
+            raise ValueError("enable_dfs must be a boolean")
+        if self.enable_dfs and self.tenant_id != DEFAULT_TENANT_ID:
+            raise ValueError("Mooncake DFS only supports the default tenant")
         if self.mode not in ("embedded", "standalone-store"):
             raise ValueError(f"unknown Mooncake mode: {self.mode!r}")
         if self.local_buffer_size <= 0:
@@ -65,6 +70,7 @@ class MooncakeStoreConfig:
             ),
             enable_offload=bool(config.get("enable_offload", False)),
             tenant_id=_normalize_tenant_id(config.get("tenant_id", DEFAULT_TENANT_ID)),
+            enable_dfs=config.get("enable_dfs", False),
         )
 
     @staticmethod
@@ -127,7 +133,9 @@ def setup_mooncake_store(
     store: Any, config: MooncakeStoreConfig, local_hostname: str
 ) -> None:
     """Initialize a native Store, preserving explicit tenant configuration."""
-    setup_kwargs: dict[str, str] = {}
+    setup_kwargs: dict[str, Any] = {}
+    if config.enable_dfs:
+        setup_kwargs["enable_ssd_offload"] = True
     if config.tenant_id != DEFAULT_TENANT_ID:
         setup_kwargs["tenant_id"] = config.tenant_id
     ret = store.setup(

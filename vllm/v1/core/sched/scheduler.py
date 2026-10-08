@@ -2836,6 +2836,18 @@ class Scheduler(SchedulerInterface):
             )
         )
 
+    def can_reset_prefix_cache(self, reset_running_requests: bool = False) -> bool:
+        if self.running and not reset_running_requests:
+            return False
+        if self.deferred_frees:
+            return False
+        return not any(
+            request.num_in_flight_tokens > 0
+            or request.num_stale_output_tokens > 0
+            or request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            for request in self.requests.values()
+        )
+
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -2873,7 +2885,7 @@ class Scheduler(SchedulerInterface):
                 "which is not supported yet."
             )
 
-        if reset_connector:
+        if reset_connector and reset_successful:
             reset_successful = self.reset_connector_cache() and reset_successful
 
         if reset_successful and self.aux_output_connector is not None:

@@ -47,6 +47,21 @@ class WorkerBase:
     communicate request metadata to other workers.
     """
 
+    def prepare_kv_cache_reset(self) -> None:
+        from vllm.distributed.kv_transfer import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+
+        if not has_kv_transfer_group():
+            return
+
+        def synchronize():
+            if self.current_platform.is_cuda_alike():
+                torch.accelerator.synchronize()
+
+        get_kv_transfer_group().prepare_cache_reset(synchronize)
+
     def __init__(
         self,
         vllm_config: VllmConfig,

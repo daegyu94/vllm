@@ -1139,6 +1139,9 @@ class AsyncLLM(EngineClient):
         await self.renderer.clear_mm_cache_async()
         await self.engine_core.reset_mm_cache_async()
 
+    async def prepare_kv_cache_reset(self) -> None:
+        await self.engine_core.prepare_kv_cache_reset_async()
+
     async def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:

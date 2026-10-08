@@ -89,24 +89,23 @@ def test_reset_keeps_other_namespaces(monkeypatch, prefix):
     w.recv_request_queue.join.side_effect = lambda: events.append("recv")
     w.store = MagicMock()
 
-    def remove_by_regex(pattern, *, force):
-        assert force is True
+    def remove_by_regex(pattern):
         events.append("remove")
         matched = {key for key in keys if re.search(pattern, key)}
         keys.difference_update(matched)
         return len(matched)
 
-    def remove_all(*, force):
+    def remove_all():
         count = len(keys)
         keys.clear()
         return count
 
-    w.store.remove_by_regex.side_effect = remove_by_regex
-    w.store.remove_all.side_effect = remove_all
+    w.store.remove_by_regex_strict.side_effect = remove_by_regex
+    w.store.remove_all_strict.side_effect = remove_all
     assert _run_reset_message(monkeypatch, w) == worker.RESP_OK
     assert keys == foreign_keys
     assert events == ["send", "recv", "remove"]
-    w.store.remove_all.assert_not_called()
+    w.store.remove_all_strict.assert_not_called()
 
 
 @pytest.mark.parametrize("prefix", ["", "job-a"])
@@ -117,7 +116,7 @@ def test_reset_reports_scoped_and_global_failures(monkeypatch, prefix, result):
     w.kv_send_thread = None
     w.recv_request_queue = MagicMock()
     w.store = MagicMock()
-    remove = w.store.remove_by_regex if prefix else w.store.remove_all
+    remove = w.store.remove_by_regex_strict if prefix else w.store.remove_all_strict
     if isinstance(result, Exception):
         remove.side_effect = result
     else:
@@ -138,10 +137,10 @@ def test_unprefixed_reset_retains_legacy_global_scope(monkeypatch):
     w.kv_send_thread = None
     w.recv_request_queue = MagicMock()
     w.store = MagicMock()
-    w.store.remove_all.return_value = 3
+    w.store.remove_all_strict.return_value = 3
     assert _run_reset_message(monkeypatch, w) == worker.RESP_OK
-    w.store.remove_all.assert_called_once_with(force=True)
-    w.store.remove_by_regex.assert_not_called()
+    w.store.remove_all_strict.assert_called_once_with()
+    w.store.remove_by_regex_strict.assert_not_called()
 
 
 @pytest.mark.parametrize("prefix", ["job@child", None, 1, False])
@@ -302,6 +301,86 @@ def _make_store_recving_thread(
     )
     thread.request_queue.task_done = MagicMock()
     return thread
+
+
+@pytest.mark.parametrize("tp_rank", [0, 1, 2])
+@pytest.mark.parametrize("failure_call", [1, 2])
+@pytest.mark.parametrize("exception", [False, True])
+def test_split_load_invalidates_entire_request_on_failure(
+    tp_rank, failure_call, exception
+):
+    store = MagicMock()
+    calls = 0
+
+    def get(keys, addrs, sizes):
+        nonlocal calls
+        calls += 1
+        if calls == failure_call:
+            if exception:
+                raise RuntimeError("injected read failure")
+            return [-10] * len(keys)
+        return [256] * len(keys)
+
+    store.batch_get_into_multi_buffers.side_effect = get
+    thread = _make_store_recving_thread(
+        store,
+        tp_rank=tp_rank,
+        disk_offload_buffer_budget_bytes=2 * _DISK_OFFLOAD_SINGLE_KEY_BYTES,
+    )
+    thread._handle_request(_make_load_req("req", [b"a0", b"a1", b"a2"], token_len=48))
+    assert calls == failure_call
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
+    thread.request_queue.task_done.assert_called_once()
+
+
+@pytest.mark.parametrize("prefix", ["", "job-a"])
+@pytest.mark.parametrize("legacy_count", [0, 2])
+def test_reset_rejects_nonnegative_partial_deletion(monkeypatch, prefix, legacy_count):
+    w = worker.MooncakeStoreWorker.__new__(worker.MooncakeStoreWorker)
+    w.cache_prefix = prefix
+    w.kv_send_thread = None
+    w.recv_request_queue = MagicMock()
+    w.store = MagicMock()
+    w.store.remove_by_regex.return_value = legacy_count
+    w.store.remove_all.return_value = legacy_count
+    w.store.remove_by_regex_strict.return_value = -703
+    w.store.remove_all_strict.return_value = -703
+    assert _run_reset_message(monkeypatch, w) == worker.RESP_ERR
+
+
+def test_prepare_reset_drains_then_synchronizes_then_invalidates_local_cache():
+    events = []
+    w = worker.MooncakeStoreWorker.__new__(worker.MooncakeStoreWorker)
+    w.cache_prefix = "job.a"
+    w.kv_send_thread = MagicMock()
+    w.recv_request_queue = MagicMock()
+    w.kv_send_thread.request_queue.join.side_effect = lambda: events.append("send")
+    w.recv_request_queue.join.side_effect = lambda: events.append("recv")
+    w.store = MagicMock()
+
+    def invalidate(pattern):
+        events.append(pattern)
+        return 0
+
+    w.store.invalidate_local_cache.side_effect = invalidate
+    w.prepare_cache_reset(lambda: events.append("gpu"))
+    assert events == ["send", "recv", "gpu", r"^job\.a@"]
+    w.store.remove_by_regex_strict.assert_not_called()
+
+
+@pytest.mark.parametrize("unsupported", [False, True])
+def test_prepare_reset_fails_closed_without_local_invalidation(unsupported):
+    w = worker.MooncakeStoreWorker.__new__(worker.MooncakeStoreWorker)
+    w.cache_prefix = "job"
+    w.kv_send_thread = None
+    w.recv_request_queue = MagicMock()
+    w.store = (
+        SimpleNamespace()
+        if unsupported
+        else SimpleNamespace(invalidate_local_cache=lambda _: -1)
+    )
+    with pytest.raises(RuntimeError, match="local cache"):
+        w.prepare_cache_reset(lambda: None)
 
 
 def _make_load_req(
@@ -1692,7 +1771,7 @@ def test_store_recving_thread_reports_failed_block_ids():
     )
 
     assert thread.get_and_clear_finished_requests() == {"req-a"}
-    assert thread.get_and_clear_block_ids_with_load_errors() == {1, 2}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
     assert thread.get_and_clear_block_ids_with_load_errors() == set()
 
 
@@ -1709,7 +1788,7 @@ def test_store_recving_thread_reports_failed_block_ids_after_rotation():
         )
     )
 
-    assert thread.get_and_clear_block_ids_with_load_errors() == {2}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
 
 
 def test_store_recving_thread_reports_all_attempted_blocks_on_exception():
@@ -2262,7 +2341,7 @@ def test_recv_thread_stops_after_first_failing_disk_offload_sub_batch():
     thread._handle_request(req)
 
     assert store.batch_get_into_multi_buffers.call_count == 1
-    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
 
 
 def test_recv_thread_skips_split_when_budget_holds_all_keys():
@@ -2322,7 +2401,7 @@ def test_recv_thread_partial_load_failure_reports_block_ids_without_hma():
 
     thread._handle_request(_make_load_req("req-a", [b"h0", b"h1"], token_len=32))
 
-    assert thread.get_and_clear_block_ids_with_load_errors() == {0}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1}
     assert thread.get_and_clear_failed_requests() == set()
     assert thread.get_and_clear_finished_requests() == {"req-a"}
 

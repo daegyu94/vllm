@@ -297,6 +297,9 @@ class EngineCoreClient(ABC):
     ) -> bool:
         raise NotImplementedError
 
+    async def prepare_kv_cache_reset_async(self) -> None:
+        raise NotImplementedError
+
     async def reset_encoder_cache_async(self) -> None:
         raise NotImplementedError
 
@@ -1338,6 +1341,11 @@ class AsyncMPClient(MPClient):
             await self.call_utility_all_async(
                 "reset_prefix_cache", reset_running_requests, reset_connector
             )
+        )
+
+    async def prepare_kv_cache_reset_async(self) -> None:
+        await self.call_utility_all_async(
+            "collective_rpc", "prepare_kv_cache_reset", None, (), {}
         )
 
     async def reset_encoder_cache_async(self) -> None:

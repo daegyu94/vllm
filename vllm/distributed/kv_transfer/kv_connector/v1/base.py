@@ -775,6 +775,10 @@ class KVConnectorBase_V1(ABC):
         """
         return None
 
+    def prepare_cache_reset(self, synchronize) -> None:
+        """Synchronize before reset; async connectors must first drain producers."""
+        synchronize()
+
     def reset_cache(self) -> bool | None:
         """Reset the connector's internal cache.
 

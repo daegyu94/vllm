@@ -1362,7 +1362,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     block_id_offset = next_block_id_offset
 
         current_batch_keys: list[str] = key_list_c
-        current_batch_block_ids: list[int] = block_id_list_c
         batch_bytes = 0
         try:
             for (
@@ -1372,7 +1371,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 batch_block_ids,
             ) in load_batches:
                 current_batch_keys = batch_keys
-                current_batch_block_ids = batch_block_ids
                 batch_bytes = _sum_batch_bytes(batch_sizes)
                 tiers_by_key: dict[str, str] | None = None
                 if envs.VLLM_MOONCAKE_STORE_TIER_LOG:
@@ -1402,9 +1400,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     num_failed_keys=len(failed),
                 )
                 if failed:
-                    self._report_load_error(
-                        req_id, [block_id for _, _, block_id in failed]
-                    )
+                    self._report_load_error(req_id, block_id_list_c)
                     logger.warning(
                         "Failed to get %d Mooncake keys from sub-batch "
                         "(batch_keys=%d, first_failures=%s)",
@@ -1414,7 +1410,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     )
                     break
         except Exception as e:
-            self._report_load_error(req_id, current_batch_block_ids)
+            self._report_load_error(req_id, block_id_list_c)
             self._record_operation(
                 "load_get",
                 load_get_start,
@@ -2410,20 +2406,37 @@ class MooncakeStoreWorker:
     def group_tp_replication_factors(self) -> tuple[int, ...]:
         return self._group_tp_replication_factors
 
-    def reset_store(self) -> int:
-        """Drain local transfers and invalidate this namespace's KV.
-
-        The caller must pause and drain all replicas sharing this prefix.
-        An empty prefix preserves the legacy tenant-wide reset.
-        """
+    def drain_pending_transfers(self) -> None:
+        """Wait for locally admitted transfers; callers must stop admissions."""
         if self.kv_send_thread is not None:
             self.kv_send_thread.request_queue.join()
         self.recv_request_queue.join()
-        if self.cache_prefix:
-            return self.store.remove_by_regex(
-                "^" + re.escape(self.cache_prefix) + "@", force=True
+
+    def prepare_cache_reset(self, synchronize) -> None:
+        """Drain I/O and GPU copies before invalidating this client's local cache."""
+        self.drain_pending_transfers()
+        synchronize()
+        invalidate = getattr(self.store, "invalidate_local_cache", None)
+        if invalidate is None:
+            raise RuntimeError("Mooncake SDK does not support local cache invalidation")
+        pattern = (
+            "^" + re.escape(self.cache_prefix) + "@" if self.cache_prefix else ".*"
+        )
+        if invalidate(pattern) < 0:
+            raise RuntimeError("Mooncake failed to invalidate the client-local cache")
+
+    def reset_store(self) -> int:
+        """Delete and verify KV after all sharing replicas have drained."""
+        self.drain_pending_transfers()
+        method = "remove_by_regex_strict" if self.cache_prefix else "remove_all_strict"
+        strict_reset = getattr(self.store, method, None)
+        if strict_reset is None:
+            raise RuntimeError(
+                "Mooncake reset requires a strict-reset-capable SDK and master"
             )
-        return self.store.remove_all(force=True)
+        if self.cache_prefix:
+            return strict_reset("^" + re.escape(self.cache_prefix) + "@")
+        return strict_reset()
 
     def close(self) -> None:
         """Release the MooncakeDistributedStore handle on teardown.

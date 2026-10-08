@@ -308,7 +308,11 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 LBHNC/HND is strongly recommended for TP-sharded Store when supported. LBNHC/NHD
 creates many transfer segments and may significantly reduce PUT/GET performance.
 
-Before resetting a shared namespace, pause admission and drain transfers on every replica using that prefix. The rank-0 reset handler drains its local send and receive queues, then removes keys matching the literal prefix followed by `@`. Regex metacharacters in the prefix are escaped. Other namespaces remain available; failed deletion returns a reset failure. A build without `remove_by_regex` fails a prefixed reset and does not fall back to deleting the tenant.
+Before resetting a shared namespace, pause admission on every replica using that prefix. Prepare every TP/DP worker with `prepare_kv_cache_reset`: drain local transfers, synchronize CUDA work, then invalidate the matching client-local cache. Async clients expose `prepare_kv_cache_reset()` across all managed engine cores. Only after every participant acknowledges preparation may any scheduler reset the shared namespace; resume only after all resets succeed.
+
+A connector reset requires matching Mooncake Master/SDK support for `remove_by_regex_strict`, `remove_all_strict`, and `invalidate_local_cache`. Strict deletion checks matching metadata and active processing/task entries, including keys omitted from readable-key listings. Partial removal returns an error; a verified empty namespace may return `0` on an idempotent retry. Missing SDK support fails closed and does not fall back to best-effort or tenant-wide deletion. The native RealClient path implements these APIs; unsupported IPC/dummy clients return an error.
+
+On a split GET error or exception, the receiver conservatively invalidates every planned block of the request, including successfully loaded and unattempted blocks. This preserves the original prefix boundary under TP request rotation, at the cost of extra recomputation. This does not implement I/O cancellation/deadlines or coordinate writers outside the caller's participant set.
 
 For example, with prefill TP 4, decode TP 2, and eight KV heads, set
 `store_tp_size` to 4 on both instances. Each decode rank reads and writes two

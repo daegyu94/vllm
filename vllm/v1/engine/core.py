@@ -856,9 +856,16 @@ class EngineCore:
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
-        return self.scheduler.reset_prefix_cache(
-            reset_running_requests, reset_connector
-        )
+        if not reset_connector:
+            return self.scheduler.reset_prefix_cache(reset_running_requests, False)
+        if reset_running_requests and not self.scheduler.reset_prefix_cache(
+            True, False
+        ):
+            return False
+        if self.scheduler.has_unfinished_requests():
+            return False
+        self.model_executor.collective_rpc("prepare_kv_cache_reset")
+        return self.scheduler.reset_prefix_cache(False, True)
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.

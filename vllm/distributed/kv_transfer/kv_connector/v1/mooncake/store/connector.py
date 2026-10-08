@@ -358,6 +358,10 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         # No layerwise support - no-op
         return
 
+    def prepare_cache_reset(self, synchronize) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.prepare_cache_reset(synchronize)
+
     def wait_for_save(self):
         assert self.connector_worker is not None
         metadata = self._get_connector_metadata()

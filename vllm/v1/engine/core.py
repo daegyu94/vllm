@@ -844,14 +844,12 @@ class EngineCore:
     ) -> bool:
         if not reset_connector:
             return self.scheduler.reset_prefix_cache(reset_running_requests, False)
-        if reset_running_requests and not self.scheduler.reset_prefix_cache(
-            True, False
+        if self.batch_queue or not self.scheduler.can_reset_prefix_cache(
+            reset_running_requests
         ):
             return False
-        if self.scheduler.has_unfinished_requests():
-            return False
         self.model_executor.collective_rpc("prepare_kv_cache_reset")
-        return self.scheduler.reset_prefix_cache(False, True)
+        return self.scheduler.reset_prefix_cache(reset_running_requests, True)
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.

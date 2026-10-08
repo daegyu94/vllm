@@ -45,8 +45,9 @@ def test_prepare_cache_reset_waits_for_every_engine():
 def test_core_prepares_every_worker_before_external_reset(admitted):
     core = EngineCore.__new__(EngineCore)
     core.scheduler = MagicMock()
+    core.batch_queue = None
     core.model_executor = MagicMock()
-    core.scheduler.has_unfinished_requests.return_value = not admitted
+    core.scheduler.can_reset_prefix_cache.return_value = admitted
     events = []
 
     def reset(running, connector):

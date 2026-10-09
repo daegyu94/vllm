@@ -71,6 +71,10 @@ Set the config path via environment variable:
 export MOONCAKE_CONFIG_PATH=/path/to/mooncake_config.json
 ```
 
+## DFS initialization
+
+Set `enable_dfs=true` in the Mooncake JSON config to initialize file storage and request one DFS replica plus at least one memory replica. `dfs_replica_num` must be 1; `replica_num` defaults to 1. Unsupported SDKs and non-default DFS tenants are rejected before Store setup. This option only forwards setup and PUT configuration; GET batching and failure handling retain their upstream implementation.
+
 ## Usage
 
 ### Single-Node KV Cache Offloading

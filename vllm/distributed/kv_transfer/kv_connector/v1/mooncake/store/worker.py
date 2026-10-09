@@ -2405,6 +2405,19 @@ class MooncakeStoreWorker:
     def group_tp_replication_factors(self) -> tuple[int, ...]:
         return self._group_tp_replication_factors
 
+    def reset_store(self) -> int:
+        """Verify shared deletion after the caller has fenced every participant."""
+        if self.kv_send_thread is not None:
+            self.kv_send_thread.request_queue.join()
+            clear_sender = getattr(self.kv_send_thread, "clear_put_cache", None)
+            if clear_sender is not None:
+                clear_sender()
+        self.recv_request_queue.join()
+        scoped = getattr(self, "remove_store_keys", None)
+        if scoped is not None:
+            return scoped()
+        return self.store.remove_all_strict()
+
     def close(self) -> None:
         """Release the MooncakeDistributedStore handle on teardown.
 
@@ -2489,11 +2502,11 @@ class LookupKeyServer:
                         # otherwise stale puts can repopulate it post-reset.
                         # Safe across HMA: store.remove_all wipes the underlying
                         # flat key space, clearing every (group_id, hash) entry.
-                        if self.store_worker.kv_send_thread is not None:
-                            self.store_worker.kv_send_thread.request_queue.join()
-                        self.store_worker.store.remove_all(force=True)
-                        logger.info("Mooncake store reset via remove_all succeeded.")
-                        self.socket.send(RESP_OK)
+                        removed = self.store_worker.reset_store()
+                        if not isinstance(removed, int) or removed < 0:
+                            self.socket.send(RESP_ERR)
+                        else:
+                            self.socket.send(RESP_OK)
                     except Exception as e:
                         logger.error("Mooncake remove_all failed: %s", e)
                         self.socket.send(RESP_ERR)

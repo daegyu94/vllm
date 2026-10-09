@@ -4936,3 +4936,38 @@ def test_worker_dfs_rejects_old_sdk_before_store_setup(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="does not support dfs_replica_num"):
         worker.MooncakeStoreWorker(_make_vllm_config(), _make_kv_cache_config())
     store.setup.assert_not_called()
+
+
+def _run_reset_message(monkeypatch, store_worker):
+    socket = MagicMock()
+    monkeypatch.setattr(worker.zmq, "Context", MagicMock())
+    monkeypatch.setattr(worker, "get_zmq_rpc_path_lookup", lambda _: "inproc://reset")
+    monkeypatch.setattr(worker, "make_zmq_socket", lambda *args, **kwargs: socket)
+    with patch.object(worker.threading, "Thread") as thread:
+        server = worker.LookupKeyServer(store_worker, MagicMock())
+        process_request = thread.call_args.kwargs["target"]
+    socket.recv_multipart.return_value = [worker.RESET_MSG]
+    socket.send.side_effect = lambda _: setattr(server, "running", False)
+    process_request()
+    return socket.send.call_args.args[0]
+
+
+@pytest.mark.parametrize("result", [-1, -200, 0, 7, RuntimeError("master unavailable")])
+def test_reset_reports_scoped_and_global_failures(monkeypatch, result):
+    w = worker.MooncakeStoreWorker.__new__(worker.MooncakeStoreWorker)
+    w.kv_send_thread = None
+    w.recv_request_queue = MagicMock()
+    w.store = MagicMock()
+    remove = w.store.remove_all_strict
+    if isinstance(result, Exception):
+        remove.side_effect = result
+    else:
+        remove.return_value = result
+    expected = (
+        worker.RESP_ERR
+        if isinstance(result, Exception) or result < 0
+        else worker.RESP_OK
+    )
+    assert _run_reset_message(monkeypatch, w) == expected
+    w.recv_request_queue.join.assert_called_once()
+    remove.assert_called_once()

@@ -2603,6 +2603,7 @@ class LookupKeyClient:
         self.executor.submit(lambda: None).result()
 
     def reset(self) -> bool:
+        self.invalidate()
         return self.executor.submit(self._reset).result()
 
     def close(self):

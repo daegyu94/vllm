@@ -1082,3 +1082,24 @@ def test_shutdown_scheduler_role_is_noop():
     # Scheduler role holds no store handle, so shutdown must be a safe no-op.
     assert connector.connector_worker is None
     connector.shutdown()
+
+
+def test_reset_discards_unconsumed_lookup_results():
+    with patch.object(worker, "make_zmq_socket") as make_socket:
+        client = worker.LookupKeyClient(_make_vllm_config())
+    gate = threading.Event()
+    socket = make_socket.return_value
+    socket.recv.side_effect = _gated_recv(gate, 9)
+    try:
+        assert client.lookup("old", 128, [b"aa"], non_block=True) is None
+        gate.set()
+        client.futures["old"].result(timeout=5)
+        socket.recv.side_effect = None
+        socket.recv.return_value = protocol.RESP_OK
+        assert client.reset()
+        socket.recv.return_value = (0).to_bytes(4, "big")
+        assert client.lookup("old", 128, [b"aa"]).hit_length == 0
+    finally:
+        gate.set()
+        client.executor.shutdown(wait=True)
+        client.close()

@@ -22,6 +22,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from typing import Any, TypeVar
 
+import regex as re
 import torch
 import zmq
 
@@ -1486,6 +1487,7 @@ class MooncakeStoreWorker:
         assert kv_role is not None
         self.kv_role = kv_role
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self.cache_prefix = extra_config.get("cache_prefix", "")
         self.can_put = self.kv_role in ("kv_producer", "kv_both") or (
             extra_config.get("save_decode_cache", False)
         )
@@ -2379,6 +2381,29 @@ class MooncakeStoreWorker:
     def group_tp_replication_factors(self) -> tuple[int, ...]:
         return self._group_tp_replication_factors
 
+    def drain_pending_transfers(self) -> None:
+        """Wait for locally admitted transfers; callers must stop admissions."""
+        if self.kv_send_thread is not None:
+            self.kv_send_thread.request_queue.join()
+        self.recv_request_queue.join()
+
+    def prepare_cache_reset(self, synchronize) -> None:
+        """Drain I/O and GPU copies before invalidating this client's local cache."""
+        self.drain_pending_transfers()
+        if self.kv_send_thread is not None:
+            invalidate_sender = getattr(self.kv_send_thread, "clear_put_cache", None)
+            if invalidate_sender is not None:
+                invalidate_sender()
+        synchronize()
+        invalidate = getattr(self.store, "invalidate_local_cache", None)
+        if invalidate is None:
+            raise RuntimeError("Mooncake SDK does not support local cache invalidation")
+        pattern = (
+            "^" + re.escape(self.cache_prefix) + "@" if self.cache_prefix else ".*"
+        )
+        if invalidate(pattern) < 0:
+            raise RuntimeError("Mooncake failed to invalidate the client-local cache")
+
     def close(self) -> None:
         """Release the MooncakeDistributedStore handle on teardown.
 
@@ -2571,6 +2596,11 @@ class LookupKeyClient:
         self.socket.send(RESET_MSG)
         resp = self.socket.recv()
         return bytes(resp) == RESP_OK
+
+    def invalidate(self) -> None:
+        """Discard old lookup results and drain queued metadata RPCs."""
+        self.futures.clear()
+        self.executor.submit(lambda: None).result()
 
     def reset(self) -> bool:
         return self.executor.submit(self._reset).result()

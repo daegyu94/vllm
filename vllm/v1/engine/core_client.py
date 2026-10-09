@@ -292,6 +292,15 @@ class EngineCoreClient(ABC):
     async def reset_mm_cache_async(self) -> None:
         raise NotImplementedError
 
+    async def prepare_kv_cache_reset_async(self) -> None:
+        raise NotImplementedError
+
+    async def reset_shared_prefix_cache_async(self, reset_store: bool) -> bool:
+        raise NotImplementedError
+
+    async def sleep_after_shared_cache_reset_async(self, level: int) -> None:
+        raise NotImplementedError
+
     async def reset_prefix_cache_async(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -1330,6 +1339,27 @@ class AsyncMPClient(MPClient):
 
     async def reset_mm_cache_async(self) -> None:
         await self.call_utility_async("reset_mm_cache")
+
+    async def prepare_kv_cache_reset_async(self) -> None:
+        await self.call_utility_all_async(
+            "collective_rpc", "prepare_kv_cache_reset", None, (), {}
+        )
+
+    async def reset_shared_prefix_cache_async(self, reset_store: bool) -> bool:
+        results = await self.call_utility_all_async(
+            "reset_local_prefix_cache_for_shared_store"
+        )
+        if not all(results):
+            return False
+        if reset_store:
+            # Every managed DP engine was drained; only one sends the deletion.
+            return await self._call_utility_async(
+                "reset_prefix_cache", False, True, engine=self.core_engines[0]
+            )
+        return True
+
+    async def sleep_after_shared_cache_reset_async(self, level: int) -> None:
+        await self.call_utility_all_async("sleep_after_shared_cache_reset", level)
 
     async def reset_prefix_cache_async(
         self, reset_running_requests: bool = False, reset_connector: bool = False

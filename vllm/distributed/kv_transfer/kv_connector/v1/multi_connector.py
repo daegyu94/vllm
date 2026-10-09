@@ -141,6 +141,10 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     - Save to all connectors.
     """
 
+    def prepare_cache_reset(self, synchronize) -> None:
+        for connector in self._connectors:
+            connector.prepare_cache_reset(synchronize)
+
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
         """MultiConnector requires PIECEWISE CUDA graph mode if any of its

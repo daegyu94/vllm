@@ -184,6 +184,10 @@ class KVConnectorBase_V1(ABC):
     # HOST/DISK/P2P or override get_external_cache_hit_sources().
     _cache_hit_source = CacheHitSource.EXTERNAL_UNSPECIFIED
 
+    def prepare_cache_reset(self, synchronize) -> None:
+        """Synchronize before reset; async connectors must first drain producers."""
+        synchronize()
+
     @property
     def supports_divergent_local_hybrid_hits(self) -> bool:
         """Whether external hits can complete divergent local hybrid hits.

@@ -1139,6 +1139,24 @@ class AsyncLLM(EngineClient):
         await self.renderer.clear_mm_cache_async()
         await self.engine_core.reset_mm_cache_async()
 
+    async def prepare_kv_cache_reset(self) -> None:
+        await self.engine_core.prepare_kv_cache_reset_async()
+
+    async def reset_shared_prefix_cache(self, reset_store: bool = True) -> bool:
+        """Reset prepared local engines and optionally delete shared KV once.
+
+        The caller must fence and prepare every replica sharing this namespace.
+        """
+        return await self.engine_core.reset_shared_prefix_cache_async(reset_store)
+
+    async def sleep_after_shared_cache_reset(self, level: int = 1) -> None:
+        """Release memory during a fenced, acknowledged shared reset."""
+        if level >= 1:
+            await self.renderer.clear_mm_cache_async()
+        await self.engine_core.sleep_after_shared_cache_reset_async(level)
+        if self.logger_manager is not None:
+            self.logger_manager.record_sleep_state(1, level)
+
     async def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:

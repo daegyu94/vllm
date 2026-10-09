@@ -212,6 +212,14 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def can_reset_prefix_cache(self, reset_running_requests: bool = False) -> bool:
+        """Whether external reset can start without in-flight KV owners.
+
+        Custom schedulers may allow inactive waiting requests if they can
+        verify their KV lifetime independently of scheduler pause state.
+        """
+        return self.get_request_counts() == (0, 0)
+
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:

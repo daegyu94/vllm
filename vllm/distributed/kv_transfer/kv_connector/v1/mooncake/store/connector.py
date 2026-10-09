@@ -280,6 +280,17 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             request, block_ids, partial_tail_offloads
         )
 
+    def prepare_cache_reset(self, synchronize) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.prepare_cache_reset(synchronize)
+
+    def reset_cache_local(self) -> None:
+        """Invalidate scheduler plans without deleting the shared namespace."""
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.client.invalidate()
+        self.connector_scheduler.load_specs.clear()
+        self._kv_cache_events = None
+
     def reset_cache(self) -> bool | None:
         """Reset the external Mooncake store on prefix-cache reset.
 

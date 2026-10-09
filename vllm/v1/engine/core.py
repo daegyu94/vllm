@@ -856,9 +856,43 @@ class EngineCore:
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
-        return self.scheduler.reset_prefix_cache(
-            reset_running_requests, reset_connector
-        )
+        if not reset_connector:
+            return self.scheduler.reset_prefix_cache(reset_running_requests, False)
+        if self.batch_queue or not self.scheduler.can_reset_prefix_cache(
+            reset_running_requests
+        ):
+            return False
+        self.model_executor.collective_rpc("prepare_kv_cache_reset")
+        return self.scheduler.reset_prefix_cache(reset_running_requests, True)
+
+    def reset_local_prefix_cache_for_shared_store(self) -> bool:
+        """Clear local KV and lookup plans while the shared store stays fenced."""
+        connector = self.scheduler.get_kv_connector()
+        local_reset = getattr(connector, "reset_cache_local", None)
+        if local_reset is None:
+            raise RuntimeError("Connector does not support coordinated shared reset")
+        if (
+            not self.is_scheduler_paused()
+            or self.batch_queue
+            or not self.scheduler.can_reset_prefix_cache(False)
+        ):
+            return False
+        # abort/wait pauses can remain PAUSED_NEW; fence existing work as well.
+        self.scheduler.set_pause_state(PauseState.PAUSED_ALL)
+        self.model_executor.collective_rpc("prepare_kv_cache_reset")
+        if not self.scheduler.reset_prefix_cache(False, False):
+            return False
+        local_reset()
+        return True
+
+    def sleep_after_shared_cache_reset(self, level: int = 1) -> None:
+        """Sleep a prepared engine without repeating the coordinator's deletion."""
+        if not self.reset_local_prefix_cache_for_shared_store():
+            raise RuntimeError("Shared-reset sleep requires a paused, idle engine")
+        self.reset_mm_cache()
+        self.reset_encoder_cache()
+        if level >= 1:
+            self.model_executor.sleep(level)
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.

@@ -4856,3 +4856,83 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+@pytest.mark.parametrize("enable_dfs", [False, True])
+def test_config_from_file_forwards_dfs_setup(tmp_path, enable_dfs):
+    cfg = worker.MooncakeStoreConfig.from_file(
+        _write_mooncake_config(tmp_path, {"enable_dfs": enable_dfs})
+    )
+    store = MagicMock()
+    store.setup.return_value = 0
+    mooncake_store.setup_mooncake_store(store, cfg, "worker-a")
+    assert cfg.enable_dfs is enable_dfs
+    assert store.setup.call_args.kwargs == (
+        {"enable_ssd_offload": True} if enable_dfs else {}
+    )
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
+def test_config_rejects_non_boolean_dfs(tmp_path, value):
+    path = _write_mooncake_config(tmp_path, {"enable_dfs": value})
+    with pytest.raises(ValueError, match="enable_dfs must be a boolean"):
+        worker.MooncakeStoreConfig.from_file(path)
+
+
+def test_config_dfs_rejects_non_default_tenant():
+    with pytest.raises(ValueError, match="default tenant"):
+        _make_config(enable_dfs=True, tenant_id="tenant-a")
+
+
+@pytest.mark.parametrize("replica_num", [1, 2])
+def test_dfs_requests_memory_and_dfs_replicas(replica_num):
+    replicas = SimpleNamespace(replica_num=1, dfs_replica_num=0)
+    worker._configure_dfs_replicas(
+        _make_config(enable_dfs=True), replicas, {"replica_num": replica_num}
+    )
+    assert (replicas.replica_num, replicas.dfs_replica_num) == (replica_num, 1)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"replica_num": 0},
+        {"replica_num": -1},
+        {"replica_num": True},
+        {"replica_num": "1"},
+        {"replica_num": 1.5},
+        {"dfs_replica_num": 0},
+        {"dfs_replica_num": 2},
+        {"dfs_replica_num": False},
+    ],
+)
+def test_dfs_rejects_invalid_replicas(overrides):
+    replicas = SimpleNamespace(replica_num=1, dfs_replica_num=0)
+    with pytest.raises(ValueError, match="replica_num"):
+        worker._configure_dfs_replicas(
+            _make_config(enable_dfs=True), replicas, overrides
+        )
+    assert (replicas.replica_num, replicas.dfs_replica_num) == (1, 0)
+
+
+def test_dfs_rejects_unsupported_mooncake():
+    with pytest.raises(RuntimeError, match="does not support dfs_replica_num"):
+        worker._configure_dfs_replicas(_make_config(enable_dfs=True), object(), {})
+
+
+def test_dfs_replicas_require_dfs_initialization():
+    with pytest.raises(ValueError, match="requires enable_dfs"):
+        worker._configure_dfs_replicas(_make_config(), object(), {"dfs_replica_num": 1})
+
+
+def test_worker_dfs_rejects_old_sdk_before_store_setup(tmp_path, monkeypatch):
+    store = MagicMock()
+    _install_fake_mooncake(monkeypatch, store)
+    _patch_worker_runtime(monkeypatch)
+    monkeypatch.setenv(
+        "MOONCAKE_CONFIG_PATH",
+        _write_mooncake_config(tmp_path, {"enable_dfs": True}),
+    )
+    with pytest.raises(RuntimeError, match="does not support dfs_replica_num"):
+        worker.MooncakeStoreWorker(_make_vllm_config(), _make_kv_cache_config())
+    store.setup.assert_not_called()

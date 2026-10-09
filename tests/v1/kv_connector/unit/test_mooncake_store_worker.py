@@ -932,6 +932,84 @@ def test_store_sending_thread_records_mooncake_metrics():
     assert stats.data["save_put"][0]["status"] == "ok"
 
 
+@pytest.mark.parametrize("evict", [False, True])
+def test_successful_put_hint_avoids_precheck_but_refills_evicted_keys(evict):
+    store = MagicMock()
+    persisted = set()
+    store.batch_is_exist.side_effect = lambda keys: [int(k in persisted) for k in keys]
+
+    def put(keys, *args):
+        persisted.update(keys)
+        return [0] * len(keys)
+
+    store.batch_put_from_multi_buffers.side_effect = put
+    thread = _make_store_sending_thread(store)
+    thread.put_cache_ttl = 2.0
+    hashes = [b"a0", b"a1"]
+    _run_store_req(thread, _make_store_req("first", hashes))
+    expected = persisted.copy()
+    if evict:
+        persisted.clear()
+    _run_store_req(thread, _make_store_req("second", hashes))
+    assert persisted == expected
+    assert store.batch_is_exist.call_count == 1
+    assert store.batch_put_from_multi_buffers.call_count == 2
+
+
+def test_put_hint_expiry_failure_and_reset_force_revalidation(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.return_value = [0, 0]
+    thread = _make_store_sending_thread(store)
+    thread.put_cache_ttl = 2.0
+    hashes = [b"a0", b"a1"]
+    _run_store_req(thread, _make_store_req("first", hashes))
+    store.batch_put_from_multi_buffers.return_value = [-1, -1]
+    _run_store_req(thread, _make_store_req("failed", hashes))
+    store.batch_put_from_multi_buffers.return_value = [0, 0]
+    _run_store_req(thread, _make_store_req("retry", hashes))
+    assert store.batch_is_exist.call_count == 2
+    clock[0] = 3.0
+    _run_store_req(thread, _make_store_req("expired", hashes))
+    assert store.batch_is_exist.call_count == 3
+    thread.clear_put_cache()
+    _run_store_req(thread, _make_store_req("new-policy", hashes))
+    assert store.batch_is_exist.call_count == 4
+
+
+@pytest.mark.parametrize("result", [[0, -1], [0], RuntimeError("lost PUT response")])
+def test_put_hints_never_hide_partial_or_unknown_put_failure(result):
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    thread = _make_store_sending_thread(store)
+    thread.put_cache_ttl = 2.0
+    if isinstance(result, Exception):
+        store.batch_put_from_multi_buffers.side_effect = result
+    else:
+        store.batch_put_from_multi_buffers.return_value = result
+    _run_store_req(thread, _make_store_req("first", [b"a0", b"a1"]))
+    assert thread._saved_offset.get("first", 0) == 0
+    store.batch_put_from_multi_buffers.side_effect = None
+    store.batch_put_from_multi_buffers.return_value = [0, 0]
+    _run_store_req(thread, _make_store_req("retry", [b"a0", b"a1"]))
+    queried = store.batch_is_exist.call_args.args[0]
+    assert len(queried) == (2 if isinstance(result, Exception) else 1)
+    assert thread._saved_offset["retry"] == 32
+
+
+def test_put_cache_is_bounded_and_disabled_with_kv_events():
+    thread = _make_store_sending_thread(MagicMock())
+    thread.put_cache_ttl, thread.put_cache_max_entries = 2.0, 1
+    thread._remember_put_results(["a", "b"], [0, 0])
+    assert list(thread._put_cache) == ["b"]
+    thread.enable_kv_event = True
+    thread.store.batch_is_exist.return_value = [1]
+    assert thread._check_store_keys(["b"]) == [1]
+    thread.store.batch_is_exist.assert_called_once_with(["b"])
+
+
 def test_process_tokens_uses_mask_num_as_start_chunk():
     db = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0),
@@ -3691,6 +3769,8 @@ def _make_bare_worker(
     worker._is_hma_required = False
     worker.tp_rank = 0
     worker.enable_kv_events = False
+    worker.put_cache_ttl = 0.0
+    worker.put_cache_max_entries = 65536
     worker.load_async = True
     worker.kv_send_thread = None
     worker.kv_recv_threads = []

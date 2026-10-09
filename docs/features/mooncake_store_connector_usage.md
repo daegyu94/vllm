@@ -77,6 +77,14 @@ export MOONCAKE_CONFIG_PATH=/path/to/mooncake_config.json
 
 ## Usage
 
+### Metadata deduplication
+
+The lookup client shares a Future only while an identical token count and block-hash sequence is in flight on that client. Aborting one request does not cancel another request's shared lookup. Completed results are not reused by new requests, and reset invalidates unconsumed plans before draining the lookup RPC queue. Layout and Store namespace are fixed for the lifetime of each client.
+
+Successful PUT hints are optional: set `put_cache_ttl` (seconds, default `0`, disabled) and `put_cache_max_entries` (default `65536`) in `kv_connector_extra_config`. During the TTL, hinted keys skip `batch_is_exist` and go directly to idempotent PUT. They still perform PUT because a TTL does not guarantee residency after eviction. Failed or missing PUT results invalidate the affected hints; worker preparation and reset drain I/O before clearing all hints. KV events retain the original existence check. Duplicate PUT can cost more than the avoided existence RPC, so this option needs workload-specific measurement before enabling it.
+
+For a prepared, fenced shared Store, `AsyncLLM.reset_shared_prefix_cache(reset_store=...)` resets local KV and lookup state on every managed DP engine. If `reset_store=True`, only one engine then deletes the namespace. A coordinator must prepare every sharing replica, select one deletion owner, and require every reset ACK before updating weights or reopening admission. This API supports a single `MooncakeStoreConnector`; the regular `reset_prefix_cache` contract is unchanged.
+
 ### Distributed File Storage (DFS)
 
 Set `"enable_dfs": true` in the Mooncake JSON configuration. Configure the Master and every reader/writer with the same Mooncake DFS root, backend, shard layout, and alignment, following the [Mooncake DFS deployment guide](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/deployment/mooncake-store-deployment-guide.md). The client is initialized with `enable_ssd_offload=True`. Each put requests one memory replica and one DFS replica by default. A Mooncake build without `ReplicateConfig.dfs_replica_num` is rejected before initializing the Store.

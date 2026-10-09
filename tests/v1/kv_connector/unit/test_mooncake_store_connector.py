@@ -783,6 +783,107 @@ def test_lookup_key_client_discard_clears_state():
     gate.set()  # release the executor so the worker thread can drain
 
 
+@pytest.mark.parametrize("discard_first", [False, True])
+@pytest.mark.parametrize("queued", [False, True])
+def test_same_prefix_shares_only_inflight_lookup(discard_first, queued):
+    with patch.object(worker, "make_zmq_socket") as make_socket:
+        client = worker.LookupKeyClient(_make_vllm_config())
+    gate = threading.Event()
+    socket = make_socket.return_value
+    socket.recv.side_effect = _gated_recv(gate, 9)
+    if queued:
+        client.executor.submit(gate.wait)
+    try:
+        assert client.lookup("first", 128, [b"aa"], non_block=True) is None
+        assert client.lookup("second", 128, [b"aa"], non_block=True) is None
+        if discard_first:
+            client.discard("first")
+        gate.set()
+        assert _poll_lookup(client, "second", block_hashes=[b"aa"]) == 9
+        if not discard_first:
+            assert _poll_lookup(client, "first", block_hashes=[b"aa"]) == 9
+        assert socket.send_multipart.call_count == 1
+        # A later request must observe new metadata rather than a cached hit.
+        socket.recv.side_effect = None
+        socket.recv.return_value = (0).to_bytes(4, "big")
+        assert client.lookup("later", 128, [b"aa"]).hit_length == 0
+        assert socket.send_multipart.call_count == 2
+    finally:
+        gate.set()
+        client.executor.shutdown(wait=True)
+        client.close()
+
+
+def test_reset_discards_unconsumed_lookup_results():
+    with patch.object(worker, "make_zmq_socket") as make_socket:
+        client = worker.LookupKeyClient(_make_vllm_config())
+    gate = threading.Event()
+    socket = make_socket.return_value
+    socket.recv.side_effect = _gated_recv(gate, 9)
+    try:
+        assert client.lookup("old", 128, [b"aa"], non_block=True) is None
+        gate.set()
+        client.futures["old"].result(timeout=5)
+        socket.recv.side_effect = None
+        socket.recv.return_value = protocol.RESP_OK
+        assert client.reset()
+        socket.recv.return_value = (0).to_bytes(4, "big")
+        assert client.lookup("old", 128, [b"aa"]).hit_length == 0
+    finally:
+        gate.set()
+        client.executor.shutdown(wait=True)
+        client.close()
+
+
+@pytest.mark.parametrize("different", ["tokens", "hash", "hash-boundary"])
+def test_singleflight_does_not_merge_different_lookup_payloads(different):
+    with patch.object(worker, "make_zmq_socket") as make_socket:
+        client = worker.LookupKeyClient(_make_vllm_config())
+    gate = threading.Event()
+    socket = make_socket.return_value
+    socket.recv.side_effect = _gated_recv(gate, 9)
+    tokens = 129 if different == "tokens" else 128
+    hashes = {"tokens": [b"aa"], "hash": [b"bb"], "hash-boundary": [b"a", b"a"]}[
+        different
+    ]
+    try:
+        assert client.lookup("a", 128, [b"aa"], non_block=True) is None
+        assert client.lookup("b", tokens, hashes, non_block=True) is None
+        gate.set()
+        assert _poll_lookup(client, "a", block_hashes=[b"aa"]) == 9
+        assert _poll_lookup(client, "b", num_tokens=tokens, block_hashes=hashes) == 9
+        assert socket.send_multipart.call_count == 2
+    finally:
+        gate.set()
+        client.executor.shutdown(wait=True)
+        client.close()
+
+
+def test_singleflight_error_is_shared_and_later_query_retries():
+    with patch.object(worker, "make_zmq_socket"):
+        client = worker.LookupKeyClient(_make_vllm_config())
+    gate = threading.Event()
+
+    def fail(*args):
+        gate.wait(timeout=5)
+        raise RuntimeError("lookup unavailable")
+
+    client._lookup = fail
+    try:
+        assert client.lookup("a", 128, [], non_block=True) is None
+        assert client.lookup("b", 128, [], non_block=True) is None
+        assert client.futures["a"] is client.futures["b"]
+        gate.set()
+        assert _poll_lookup(client, "a") == 0
+        assert _poll_lookup(client, "b") == 0
+        client._lookup = lambda *args: worker.MooncakeLookupResult(7)
+        assert client.lookup("retry", 128, []).hit_length == 7
+    finally:
+        gate.set()
+        client.executor.shutdown(wait=True)
+        client.close()
+
+
 def test_get_num_new_matched_tokens_async_defers_then_reports():
     """Async lookup returns (None, False) until ready, then the hit count."""
     vllm_config = create_vllm_config(

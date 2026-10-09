@@ -22,6 +22,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from typing import Any, TypeVar
 
+import regex as re
 import torch
 import zmq
 
@@ -1486,6 +1487,9 @@ class MooncakeStoreWorker:
         assert kv_role is not None
         self.kv_role = kv_role
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self.cache_prefix = extra_config.get("cache_prefix", "")
+        if not isinstance(self.cache_prefix, str) or "@" in self.cache_prefix:
+            raise ValueError("cache_prefix must be a string without '@'")
         self.can_put = self.kv_role in ("kv_producer", "kv_both") or (
             extra_config.get("save_decode_cache", False)
         )
@@ -2378,6 +2382,14 @@ class MooncakeStoreWorker:
     @property
     def group_tp_replication_factors(self) -> tuple[int, ...]:
         return self._group_tp_replication_factors
+
+    def remove_store_keys(self) -> int:
+        """Scope the strict reset consumer to a literal job prefix boundary."""
+        if self.cache_prefix:
+            return self.store.remove_by_regex_strict(
+                "^" + re.escape(self.cache_prefix) + "@"
+            )
+        return self.store.remove_all_strict()
 
     def close(self) -> None:
         """Release the MooncakeDistributedStore handle on teardown.

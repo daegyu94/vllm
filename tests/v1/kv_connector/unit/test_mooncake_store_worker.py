@@ -4856,3 +4856,26 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+@pytest.mark.parametrize("prefix", ["job-a", "job.a+(x)[y]", r"job\a"])
+def test_selective_strict_reset_preserves_other_prefixes(prefix):
+    import regex as re
+
+    owned = prefix + "@model@hash"
+    foreign = {"other@model@hash", prefix + "-other@model@hash"}
+    keys = {owned, *foreign}
+    w = worker.MooncakeStoreWorker.__new__(worker.MooncakeStoreWorker)
+    w.cache_prefix = prefix
+    w.store = MagicMock()
+
+    def remove(pattern):
+        matched = {key for key in keys if re.search(pattern, key)}
+        keys.difference_update(matched)
+        return len(matched)
+
+    w.store.remove_by_regex_strict.side_effect = remove
+    assert w.remove_store_keys() == 1
+    assert keys == foreign
+    assert w.remove_store_keys() == 0
+    w.store.remove_all_strict.assert_not_called()

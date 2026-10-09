@@ -62,6 +62,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
+from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
@@ -7544,3 +7545,127 @@ def test_diffusion_read_deferral_keeps_a_longer_pp_wait():
     # Deferring this step alone would ask for 6. The PP wait to 7 stands.
     assert "read" not in scheduler.schedule().num_scheduled_tokens
     assert read.next_decode_eligible_step == 7
+
+
+@pytest.mark.parametrize("pause_state", [PauseState.UNPAUSED, PauseState.PAUSED_ALL])
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_core_connector_reset_preempts_and_recomputes_waiting_requests(
+    pause_state, async_scheduling
+):
+    scheduler = create_scheduler(
+        max_num_seqs=1, enable_prefix_caching=True, async_scheduling=async_scheduling
+    )
+    running, waiting = create_requests(num_requests=2)
+    for request in (running, waiting):
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[running.request_id],
+            req_id_to_index={running.request_id: 0},
+            sampled_token_ids=[[1]],
+        ),
+    )
+    scheduler.set_pause_state(pause_state)
+    scheduler.connector = Mock()
+    scheduler.connector.reset_cache.return_value = True
+    scheduler.connector_prefix_cache_stats = PrefixCacheStats()
+    core = EngineCore.__new__(EngineCore)
+    core.scheduler = scheduler
+    core.batch_queue = None
+    core.model_executor = Mock()
+
+    def prepare(method):
+        assert method == "prepare_kv_cache_reset"
+        assert scheduler.running == [running]
+        assert scheduler.kv_cache_manager.get_block_ids(running.request_id)[0]
+
+    core.model_executor.collective_rpc.side_effect = prepare
+    assert core.reset_prefix_cache(True, True)
+    scheduler.connector.reset_cache.assert_called_once()
+    assert list(scheduler.waiting) == [running, waiting]
+    assert running.num_computed_tokens == 0
+    assert running.status == RequestStatus.PREEMPTED
+    assert list(running.output_token_ids) == [1]
+    assert not scheduler.kv_cache_manager.get_block_ids(running.request_id)[0]
+    scheduler.connector = None
+    scheduler.set_pause_state(PauseState.UNPAUSED)
+    resumed = scheduler.schedule()
+    assert resumed.num_scheduled_tokens == {running.request_id: running.num_tokens}
+
+
+@pytest.mark.parametrize("failure_phase", ["prepare", "delete"])
+def test_core_connector_reset_failure_preserves_request_lifetime(failure_phase):
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[1]],
+        ),
+    )
+    scheduler.connector = Mock()
+    scheduler.connector_prefix_cache_stats = PrefixCacheStats()
+    scheduler.connector.reset_cache.return_value = False
+    core = EngineCore.__new__(EngineCore)
+    core.scheduler = scheduler
+    core.batch_queue = None
+    core.model_executor = Mock()
+    if failure_phase == "prepare":
+        core.model_executor.collective_rpc.side_effect = RuntimeError("prepare failed")
+        with pytest.raises(RuntimeError, match="prepare failed"):
+            core.reset_prefix_cache(True, True)
+        assert scheduler.running == [request]
+        assert scheduler.kv_cache_manager.get_block_ids(request.request_id)[0]
+        scheduler.connector.reset_cache.assert_not_called()
+    else:
+        assert not core.reset_prefix_cache(True, True)
+        assert list(scheduler.waiting) == [request]
+        assert request.num_computed_tokens == 0
+        scheduler.connector.reset_cache.return_value = True
+        assert core.reset_prefix_cache(False, True)  # retry with inactive waiting work
+
+
+@pytest.mark.parametrize("unsafe", ["batch", "tokens", "remote", "retained", "running"])
+def test_core_connector_reset_rejects_active_kv_owners_even_when_paused(unsafe):
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    scheduler.set_pause_state(PauseState.PAUSED_ALL)
+    core = EngineCore.__new__(EngineCore)
+    core.scheduler = scheduler
+    core.batch_queue = [object()] if unsafe == "batch" else None
+    core.model_executor = Mock()
+    if unsafe == "tokens":
+        request.num_in_flight_tokens = 1
+    elif unsafe == "remote":
+        request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    elif unsafe == "retained":
+        scheduler.deferred_frees.append((1, []))
+    elif unsafe == "running":
+        scheduler.waiting.pop_request()
+        scheduler.running.append(request)
+        request.status = RequestStatus.RUNNING
+    scheduler.connector = Mock()
+    scheduler.connector.reset_cache.return_value = True
+    assert not core.reset_prefix_cache(
+        reset_running_requests=unsafe != "running", reset_connector=True
+    )
+    scheduler.connector.reset_cache.assert_not_called()
+    core.model_executor.collective_rpc.assert_not_called()
+
+
+def test_failed_local_prefix_reset_does_not_delete_shared_kv():
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    scheduler.schedule()  # The real block pool still has a live KV owner.
+    scheduler.connector = Mock()
+    scheduler.connector.reset_cache.return_value = True
+    assert not scheduler.reset_prefix_cache(reset_connector=True)
+    scheduler.connector.reset_cache.assert_not_called()

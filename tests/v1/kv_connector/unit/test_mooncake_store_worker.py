@@ -4956,6 +4956,7 @@ def _run_reset_message(monkeypatch, store_worker):
 def test_reset_reports_scoped_and_global_failures(monkeypatch, result):
     w = worker.MooncakeStoreWorker.__new__(worker.MooncakeStoreWorker)
     w.kv_send_thread = None
+    w.cache_prefix = ""
     w.recv_request_queue = MagicMock()
     w.store = MagicMock()
     remove = w.store.remove_all_strict
@@ -4971,3 +4972,26 @@ def test_reset_reports_scoped_and_global_failures(monkeypatch, result):
     assert _run_reset_message(monkeypatch, w) == expected
     w.recv_request_queue.join.assert_called_once()
     remove.assert_called_once()
+
+
+@pytest.mark.parametrize("prefix", ["job-a", "job.a+(x)[y]", r"job\a"])
+def test_selective_strict_reset_preserves_other_prefixes(prefix):
+    import regex as re
+
+    owned = prefix + "@model@hash"
+    foreign = {"other@model@hash", prefix + "-other@model@hash"}
+    keys = {owned, *foreign}
+    w = worker.MooncakeStoreWorker.__new__(worker.MooncakeStoreWorker)
+    w.cache_prefix = prefix
+    w.store = MagicMock()
+
+    def remove(pattern):
+        matched = {key for key in keys if re.search(pattern, key)}
+        keys.difference_update(matched)
+        return len(matched)
+
+    w.store.remove_by_regex_strict.side_effect = remove
+    assert w.remove_store_keys() == 1
+    assert keys == foreign
+    assert w.remove_store_keys() == 0
+    w.store.remove_all_strict.assert_not_called()

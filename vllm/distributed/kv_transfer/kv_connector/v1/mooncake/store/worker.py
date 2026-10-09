@@ -17,6 +17,7 @@ import queue
 import socket
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
@@ -440,6 +441,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         supports_group_ids: bool = False,
         record_operation: Callable[..., None] | None = None,
         group_participates: Sequence[bool] | None = None,
+        put_cache_ttl: float = 0.0,
+        put_cache_max_entries: int = 65536,
     ):
         super().__init__(
             store,
@@ -486,6 +489,65 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Retained only after a failed store so retry events can recover the
         # token suffix without full snapshots on the normal path.
         self._retry_token_ids: dict[str, tuple[int, list[int]]] = {}
+        if not math.isfinite(put_cache_ttl) or put_cache_ttl < 0:
+            raise ValueError("put_cache_ttl must be finite and nonnegative")
+        if put_cache_max_entries <= 0:
+            raise ValueError("put_cache_max_entries must be positive")
+        self.put_cache_ttl = put_cache_ttl
+        self.put_cache_max_entries = put_cache_max_entries
+        self._put_cache: OrderedDict[str, float] = OrderedDict()
+
+    def clear_put_cache(self) -> None:
+        """Invalidate hints after the sender has drained at a policy boundary."""
+        self._put_cache.clear()
+
+    def _check_store_keys(self, keys: list[str]) -> list[int]:
+        now = time.monotonic()
+        while self._put_cache:
+            key, deadline = next(iter(self._put_cache.items()))
+            if deadline > now:
+                break
+            self._put_cache.pop(key)
+        # Hints never prove residency: idempotent PUT also refills evicted keys.
+        query_indices = [
+            i
+            for i, key in enumerate(keys)
+            if self.enable_kv_event
+            or self.put_cache_ttl == 0
+            or self._put_cache.get(key, 0) <= now
+        ]
+        states = [0] * len(keys)
+        if query_indices:
+            query_keys = [keys[i] for i in query_indices]
+            start = time.perf_counter()
+            try:
+                results = self.store.batch_is_exist(query_keys)
+                if len(results) != len(query_keys):
+                    raise RuntimeError("Incomplete Mooncake existence response")
+            except Exception:
+                self._record_operation(
+                    "save_exists",
+                    start,
+                    len(query_keys),
+                    status="error",
+                    num_failed_keys=len(query_keys),
+                )
+                raise
+            self._record_operation("save_exists", start, len(query_keys))
+            for i, result in zip(query_indices, results, strict=True):
+                states[i] = result
+        return states
+
+    def _remember_put_results(self, keys: list[str], results: list[int]) -> None:
+        if self.enable_kv_event or self.put_cache_ttl == 0:
+            return
+        deadline = time.monotonic() + self.put_cache_ttl
+        for i, key in enumerate(keys):
+            self._put_cache.pop(key, None)
+            if i < len(results) and results[i] >= 0:
+                self._put_cache[key] = deadline
+        while len(self._put_cache) > self.put_cache_max_entries:
+            self._put_cache.popitem(last=False)
 
     def add_request(self, request: ReqMeta) -> None:
         # Register before enqueueing so a job is never picked up unledgered.
@@ -950,23 +1012,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 return
 
             # Check which blocks already exist (dedup)
-            save_exists_start = time.perf_counter()
-            try:
-                exists_states = self.store.batch_is_exist(keys)
-            except Exception:
-                self._record_operation(
-                    "save_exists",
-                    save_exists_start,
-                    len(keys),
-                    status="error",
-                    num_failed_keys=len(keys),
-                )
-                raise
-            self._record_operation(
-                "save_exists",
-                save_exists_start,
-                len(keys),
-            )
+            exists_states = self._check_store_keys(keys)
             missing_indices = [
                 i for i, exists in enumerate(exists_states) if exists != 1
             ]
@@ -1052,6 +1098,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     self.replicate_config,
                 )
             except Exception as e:
+                self._remember_put_results(keys, [])
                 self._record_operation(
                     "save_put",
                     put_start,
@@ -1063,7 +1110,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 logger.error("Failed to put key %s, error: %s", keys, e)
                 put_had_exception = True
             else:
-                failed_indices = {i for i, value in enumerate(res) if value < 0}
+                self._remember_put_results(keys, res)
+                failed_indices = {
+                    i for i in range(len(keys)) if i >= len(res) or res[i] < 0
+                }
                 self._record_operation(
                     "save_put",
                     put_start,
@@ -1072,7 +1122,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     status="partial_failure" if failed_indices else "ok",
                     num_failed_keys=len(failed_indices),
                 )
-                failed_codes = {res[i] for i in failed_indices}
+                failed_codes = {res[i] for i in failed_indices if i < len(res)}
                 if failed_indices:
                     logger.warning(
                         "batch_put failed: %d/%d keys failed "
@@ -1512,6 +1562,10 @@ class MooncakeStoreWorker:
         assert kv_role is not None
         self.kv_role = kv_role
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self.put_cache_ttl = float(extra_config.get("put_cache_ttl", 0.0))
+        self.put_cache_max_entries = int(
+            extra_config.get("put_cache_max_entries", 65536)
+        )
         self.cache_prefix = extra_config.get("cache_prefix", "")
         if not isinstance(self.cache_prefix, str) or "@" in self.cache_prefix:
             raise ValueError("cache_prefix must be a string without '@'")
@@ -2047,6 +2101,8 @@ class MooncakeStoreWorker:
                     group.kv_cache_spec.prefix_cacheable
                     for group in self._kv_cache_groups
                 ],
+                put_cache_ttl=self.put_cache_ttl,
+                put_cache_max_entries=self.put_cache_max_entries,
             )
             self.kv_send_thread.start()
 

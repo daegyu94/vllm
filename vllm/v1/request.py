@@ -186,6 +186,8 @@ class Request:
         # Oldest weight epoch over the KV this request reads; set on admission
         # with kv_weight_provenance. Epochs only grow, so later steps keep it.
         self.kv_floor_epoch: int | None = None
+        # Whether kv_floor_epoch was set since last reported on an output.
+        self.kv_floor_changed = False
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related

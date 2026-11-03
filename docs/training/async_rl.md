@@ -95,6 +95,17 @@ An aborted request returns spans over its partial output. If you resubmit that o
 
 Weights may then only change while running requests are frozen by `pause_generation(mode="keep")`, or while nothing runs; the weight update calls and `update_weight_version` raise otherwise. Under data parallelism each engine checks this on its own, so pause every engine before updating. A failed update still starts an epoch, since it may have changed some weights. `collective_rpc("finish_weight_update")`, `collective_rpc("reload_weights")` and `collective_rpc("reset_weights")` are refused, as they would change weights without an epoch; weight changes through a worker extension aren't tracked unless you also set a new label. KV loaded by a KV connector, and models with sliding-window bounded replay (DeepSeek-V4.1), have an unknown epoch.
 
+The final output of every sequence then also carries `kv_versions`, spans over the same output-token indexes as `weight_versions`, each naming the oldest weights whose KV those tokens attended to (`None` if unknown):
+
+```python
+for span in completion.kv_versions:
+    # Tokens in [span.start, span.end) attended to KV whose oldest part was
+    # computed by weights labelled `span.floor`.
+    print(span.floor, completion.token_ids[span.start : span.end])
+```
+
+A token attended only to KV from the weights that sampled it when its `kv_versions` label matches its `weight_versions` label. A request kept across an update with `clear_cache=False` keeps the old label for the rest of its output; with `clear_cache=True` it is recomputed and takes the new one. Labels are reported as they were when the weights were loaded, so set a new one with every update. `/v1/completions` and `/v1/chat/completions` return it on each choice when the request sets `return_kv_versions: true`, with the same streaming and abort behavior as `weight_versions`; `/inference/v1/generate` doesn't return it yet. Only the target model's KV is covered, not a draft model's. The Rust frontend doesn't support `--kv-weight-provenance` yet: its weight-update finish call is refused.
+
 ## Example
 
 The [async RLHF example](../../examples/rl/rlhf_async_new_apis.py) demonstrates this pattern with `vllm.AsyncLLMEngine`, NCCL weight transfer, and mid-flight pause/resume with validation.

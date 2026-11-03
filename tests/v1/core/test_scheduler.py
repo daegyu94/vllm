@@ -58,7 +58,7 @@ from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
-from vllm.v1.engine import FinishReason
+from vllm.v1.engine import FinishReason, KVFloor
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.hisparse.coordinator import get_hisparse_coordinator
@@ -8901,7 +8901,7 @@ def test_kv_floor_across_keep_pause_and_cache_reset(async_scheduling):
 
     step()
     scheduler.set_pause_state(PauseState.PAUSED_ALL)
-    scheduler.set_weight_epoch(1)
+    scheduler.set_weight_epoch(1, "v1")
     scheduler.set_pause_state(PauseState.UNPAUSED)
     while req.num_computed_tokens < 64:
         step()
@@ -8972,3 +8972,66 @@ def test_untracked_weight_rpcs_refused_with_provenance():
             core.collective_rpc(method)
     core.model_executor.collective_rpc.assert_not_called()
     _weight_epoch_core(kv_weight_provenance=False).collective_rpc("reset_weights")
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_kv_floor_reported_with_outputs(async_scheduling):
+    """Outputs carry the label of the oldest weights whose KV the request
+    attends to, sent only when it changes: a prefix hit on blocks computed
+    before an update reports the old weights, recomputing after a reset the new."""
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        async_scheduling=async_scheduling,
+        kv_weight_provenance=True,
+    )
+    scheduler.set_weight_epoch(0, "v0")
+    kept, hit = create_requests(
+        2,
+        num_tokens=33,
+        max_tokens=100,
+        ignore_eos=True,
+        same_prompt=True,
+        req_ids=["kept", "hit"],
+    )
+    fresh = create_requests(
+        2, num_tokens=33, max_tokens=100, ignore_eos=True, req_ids=["_", "fresh"]
+    )[1]
+
+    def step() -> dict[str, KVFloor | None]:
+        output = scheduler.schedule()
+        outputs = scheduler.update_from_output(output, make_output(scheduler))
+        return {
+            o.request_id: o.kv_floor for eco in outputs.values() for o in eco.outputs
+        }
+
+    scheduler.add_request(kept)
+    assert step() == {"kept": KVFloor("v0")}
+    assert step() == {"kept": None}
+
+    scheduler.set_pause_state(PauseState.PAUSED_ALL)
+    scheduler.set_weight_epoch(1, "v1")
+    scheduler.set_pause_state(PauseState.UNPAUSED)
+    scheduler.add_request(hit)
+    scheduler.add_request(fresh)
+    assert step() == {"kept": None, "hit": KVFloor("v0"), "fresh": KVFloor("v1")}
+
+    # pause(clear_cache=True) preempts and recomputes with the new weights.
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    floors: dict[str, KVFloor | None] = {}  # first output after the reset
+    while len(floors) < 3:
+        for req_id, floor in step().items():
+            floors.setdefault(req_id, floor)
+    assert floors == {
+        "kept": KVFloor("v1"),
+        "hit": KVFloor("v1"),
+        "fresh": KVFloor("v1"),
+    }
+
+
+def test_kv_floor_not_reported_by_default():
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    (req,) = create_requests(1, num_tokens=20, max_tokens=1)
+    scheduler.add_request(req)
+    output = scheduler.schedule()
+    (eco,) = scheduler.update_from_output(output, make_output(scheduler))[0].outputs
+    assert eco.finished and eco.kv_floor is None

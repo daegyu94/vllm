@@ -816,6 +816,12 @@ class OpenAIServingChat(GenerateBaseServing):
                                 if request.return_weight_versions
                                 else None
                             ),
+                            # Unset unless opted in, so other chunks stay unchanged.
+                            **(
+                                {"kv_versions": output.kv_versions}
+                                if request.return_kv_versions
+                                else {}
+                            ),
                         )
 
                         finish_reason_sent[i] = True
@@ -1080,6 +1086,9 @@ class OpenAIServingChat(GenerateBaseServing):
                 routed_experts=routed_experts_b64,
                 weight_versions=(
                     output.weight_versions if request.return_weight_versions else None
+                ),
+                kv_versions=(
+                    output.kv_versions if request.return_kv_versions else None
                 ),
             )
 

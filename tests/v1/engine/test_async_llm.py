@@ -28,7 +28,7 @@ from vllm.exceptions import (
     VLLMValidationError,
 )
 from vllm.inputs import PromptType
-from vllm.outputs import RequestOutput
+from vllm.outputs import KVVersionSpan, RequestOutput, WeightVersionSpan
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import WorkerProfiler
 from vllm.sampling_params import RequestOutputKind
@@ -1325,6 +1325,60 @@ async def test_pause_keep_single_request():
         assert pause_gap >= pause_duration * 0.8, (
             f"Expected gap of ~{pause_duration}s after pause, got {pause_gap:.3f}s"
         )
+
+
+@pytest.mark.asyncio
+async def test_kv_versions_across_keep_weight_update():
+    """A request kept across a weight update samples with the new weights but
+    attends to KV from the old ones, and so does a later request that hits
+    its prefix-cache blocks; kv_versions reports both, unlike weight_versions."""
+    engine_args = AsyncEngineArgs(
+        model="Qwen/Qwen3-0.6B",
+        enforce_eager=True,
+        enable_prefix_caching=True,
+        gpu_memory_utilization=0.5,
+        kv_cache_memory_bytes=1 << 30,
+        max_model_len=2048,
+        kv_weight_provenance=True,
+    )
+    prompt = TEXT_PROMPT * 8
+    params = SamplingParams(max_tokens=30, ignore_eos=True)
+    with ExitStack() as after:
+        with set_default_torch_num_threads(1):
+            engine = AsyncLLM.from_engine_args(engine_args)
+        after.callback(engine.shutdown)
+
+        async def generate(request_id: str, prompt: str) -> RequestOutput:
+            async for output in engine.generate(
+                prompt=prompt, sampling_params=params, request_id=request_id
+            ):
+                if len(output.outputs[0].token_ids) == 5 and request_id == "kept":
+                    pause_reached.set()
+            return output
+
+        async def update_weight_version() -> int:
+            await pause_reached.wait()
+            await engine.pause_generation(mode="keep", clear_cache=False)
+            await engine.update_weight_version("v1")
+            await engine.resume_generation()
+            return 0
+
+        pause_reached = asyncio.Event()
+        kept, _ = await asyncio.wait_for(
+            asyncio.gather(generate("kept", prompt), update_weight_version()),
+            timeout=120.0,
+        )
+        hit = await generate("hit", prompt)
+        fresh = await generate("fresh", "A different prompt entirely.")
+
+    kept_out, hit_out, fresh_out = (o.outputs[0] for o in (kept, hit, fresh))
+    (old, new) = kept_out.weight_versions
+    assert (old.version, new.version, new.end) == ("default", "v1", 30)
+    assert kept_out.kv_versions == [KVVersionSpan("default", 0, 30)]
+    assert hit.num_cached_tokens > 0
+    assert hit_out.weight_versions == [WeightVersionSpan("v1", 0, 30)]
+    assert hit_out.kv_versions == [KVVersionSpan("default", 0, 30)]
+    assert fresh_out.kv_versions == [KVVersionSpan("v1", 0, 30)]
 
 
 @pytest.mark.asyncio

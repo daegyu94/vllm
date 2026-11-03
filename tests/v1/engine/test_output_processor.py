@@ -24,6 +24,7 @@ from vllm.logprobs import FlatLogprobs, Logprob, PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     CompletionOutput,
+    KVVersionSpan,
     PoolingRequestOutput,
     RequestError,
     RequestOutput,
@@ -39,6 +40,7 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
     FinishReason,
+    KVFloor,
 )
 from vllm.v1.engine.output_processor import (
     OutputProcessor,
@@ -97,6 +99,7 @@ def test_completion_output_preserves_each_sampling_mask_position() -> None:
     state.routed_experts_chunks = []
     state.spec_decode_metrics = None
     state.weight_version_starts = []
+    state.kv_floor_starts = []
 
     output = state._new_completion_output([1, 2, 3], FinishReason.LENGTH, None)
 
@@ -1881,6 +1884,7 @@ def test_sampling_masks_follow_output_kind(output_kind):
     state.routed_experts_chunks = []
     state.spec_decode_metrics = None
     state.weight_version_starts = []
+    state.kv_floor_starts = []
 
     supports = [[10, 11], [20], [30, 31]]
     masks = []
@@ -2060,3 +2064,54 @@ def test_weight_version_spans(output_kind: RequestOutputKind, steps, expected):
     final = queue.get_nowait()
     assert final is not None and final.finished
     assert final.outputs[0].weight_versions == [WeightVersionSpan(*s) for s in expected]
+
+
+@pytest.mark.parametrize(
+    "output_kind", [RequestOutputKind.DELTA, RequestOutputKind.FINAL_ONLY]
+)
+def test_kv_version_spans(output_kind: RequestOutputKind):
+    """The engine sends a KV floor only when it changes; each change starts a
+    span over the output tokens, and an unknown floor is a span of None."""
+    output_processor = OutputProcessor(tokenizer=None, log_stats=False)
+    queue = RequestOutputCollector(output_kind, request_id="request-0-int")
+    request = EngineCoreRequest(
+        request_id="request-0-int",
+        external_req_id="request-0",
+        prompt_token_ids=[1, 2, 3],
+        mm_features=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=SamplingParams(detokenize=False, output_kind=output_kind),
+        pooling_params=None,
+    )
+    output_processor.add_request(request, prompt=None, queue=queue)
+
+    steps = [
+        (KVFloor("v7"), [10, 11]),
+        (None, [12]),
+        (KVFloor("v7"), [13]),  # re-admitted with the same floor: one span
+        (KVFloor("v8"), [14]),
+        (KVFloor(None), [15, 16]),
+    ]
+    for kv_floor, token_ids in steps:
+        output_processor.process_outputs(
+            [
+                EngineCoreOutput(
+                    request_id="request-0-int",
+                    new_token_ids=list(token_ids),
+                    kv_floor=kv_floor,
+                )
+            ]
+        )
+    output_processor.abort_requests(["request-0"], internal=False)
+    final = None
+    while (item := queue.get_nowait()) is not None:
+        final = item
+    assert final is not None and final.finished
+    assert final.outputs[0].kv_versions == [
+        KVVersionSpan("v7", 0, 4),
+        KVVersionSpan("v8", 4, 5),
+        KVVersionSpan(None, 5, 7),
+    ]

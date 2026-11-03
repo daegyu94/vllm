@@ -5,7 +5,7 @@ import enum
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 import msgspec
 import numpy as np
@@ -64,6 +64,13 @@ class CheckpointState(enum.StrEnum):
 class EEPNotificationType(enum.Enum):
     RECONFIGURE_FINISHED = "RECONFIGURE_FINISHED"
     SHUTDOWN_COMPLETE = "SHUTDOWN_COMPLETE"
+
+
+class KVFloor(NamedTuple):
+    """Label of the oldest weights whose KV a request attends to; None when
+    unknown, e.g. for KV loaded by a KV connector."""
+
+    version: str | None
 
 
 class FinishReason(enum.IntEnum):
@@ -297,6 +304,11 @@ class EngineCoreOutput(
     # Sent once, on the first output, when watermark_config is set. Appended last
     # for array_like compatibility.
     watermarking: bool | None = None
+
+    # Set when the request's KVFloor changes (kv_weight_provenance); tokens
+    # until the next change were sampled with it. Appended last for
+    # array_like compatibility.
+    kv_floor: KVFloor | None = None
 
     @property
     def finished(self) -> bool:

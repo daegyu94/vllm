@@ -56,6 +56,17 @@ class WeightVersionSpan:
 
 
 @dataclass
+class KVVersionSpan:
+    """Output tokens `[start, end)` were sampled by a forward pass whose oldest
+    attended KV was computed by weights labelled `floor`; None when unknown,
+    e.g. for KV loaded by a KV connector."""
+
+    floor: str | None
+    start: int
+    end: int
+
+
+@dataclass
 class CompletionOutput:
     """The output data of one completion output of a request.
 
@@ -81,6 +92,9 @@ class CompletionOutput:
             single-sequence (``n == 1``) requests.
         weight_versions: Contiguous weight version spans over output-token indexes.
             Set on the final output only.
+        kv_versions: Contiguous spans over output-token indexes of the oldest
+            weights whose KV each token attended to, with kv_weight_provenance.
+            Set on the final output only.
 
     """
 
@@ -96,6 +110,7 @@ class CompletionOutput:
     sampling_mask: SamplingMask | None = None
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
     weight_versions: list[WeightVersionSpan] | None = None
+    kv_versions: list[KVVersionSpan] | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -245,6 +260,7 @@ class RequestOutput:
                             completion.routed_experts = next_completion.routed_experts
                         # Like finish_reason, spans come only with the terminal output.
                         completion.weight_versions = next_completion.weight_versions
+                        completion.kv_versions = next_completion.kv_versions
                         completion.finish_reason = next_completion.finish_reason
                         completion.stop_reason = next_completion.stop_reason
                     else:

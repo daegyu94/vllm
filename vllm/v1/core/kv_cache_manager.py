@@ -602,6 +602,7 @@ class KVCacheManager:
             request.kv_floor_epoch = self._admission_kv_floor(
                 new_computed_block_list, num_external_computed_tokens
             )
+            request.kv_floor_changed = True
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks

@@ -55,7 +55,12 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    KVFloor,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
@@ -487,6 +492,8 @@ class Scheduler(SchedulerInterface):
         self.return_sampling_mask = vllm_config.model_config.return_sampling_mask
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+        # Version label of each weight epoch (kv_weight_provenance).
+        self.weight_epoch_labels: dict[int, str] = {}
 
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
@@ -2539,6 +2546,9 @@ class Scheduler(SchedulerInterface):
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                         watermarking=watermarking,
+                        kv_floor=(
+                            self._take_kv_floor(request) if new_token_ids else None
+                        ),
                     )
                 )
             else:
@@ -3079,8 +3089,19 @@ class Scheduler(SchedulerInterface):
         logger.info("setting pause state to %s", pause_state.name)
         self._pause_state = pause_state
 
-    def set_weight_epoch(self, weight_epoch: int) -> None:
+    def set_weight_epoch(self, weight_epoch: int, weight_version: str) -> None:
         self.kv_cache_manager.weight_epoch = weight_epoch
+        self.weight_epoch_labels[weight_epoch] = weight_version
+
+    def _take_kv_floor(self, request: Request) -> KVFloor | None:
+        """The request's KV floor if it changed since last reported. It
+        changes only on admission, and epochs change only while paused, so it
+        holds for every token sampled since."""
+        if not request.kv_floor_changed:
+            return None
+        request.kv_floor_changed = False
+        epoch = request.kv_floor_epoch
+        return KVFloor(None if epoch is None else self.weight_epoch_labels.get(epoch))
 
     def _request_blocks_can_be_freed(self, request: Request) -> bool:
         # We must defer freeing blocks if an async kv connector may

@@ -49,7 +49,7 @@ from vllm.exceptions import GenerationError, QueueOverflowError, VLLMValidationE
 from vllm.inputs import TokensPrompt
 from vllm.logprobs import Logprob
 from vllm.multimodal.inputs import PlaceholderRange
-from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.outputs import CompletionOutput, KVVersionSpan, RequestOutput
 from vllm.parser import HarmonyParser
 from vllm.renderers.hf import HfRenderer
 from vllm.renderers.mistral import MistralRenderer
@@ -3482,3 +3482,54 @@ async def test_non_streaming_finish_reason_matches_tool_calls(
     assert bool(choice.message.tool_calls) == (text != "Hello, how are you?"), (
         "finish_reason must reflect whether tool calls were emitted"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("opt_in", [False, True])
+async def test_chat_kv_versions_opt_in(stream: bool, opt_in: bool):
+    """kv_versions is returned on the final choice only when requested;
+    opted-out streaming chunks don't gain the field."""
+    request_output = _make_metrics_request_output()
+    request_output.outputs[0].kv_versions = [KVVersionSpan("v0", 0, 2)]
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Test prompt"}],
+        max_tokens=10,
+        stream=stream,
+        return_kv_versions=opt_in,
+    )
+    kwargs = dict(
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    )
+    expected = [{"floor": "v0", "start": 0, "end": 2}]
+    if stream:
+        finals = []
+        async for line in serving.chat_completion_stream_generator(
+            request,
+            _single_request_output(request_output),
+            "chatcmpl-test-id",
+            "test-model",
+            **kwargs,
+        ):
+            payload = line.strip().removeprefix("data: ")
+            if payload.startswith("{"):
+                finals += [
+                    c for c in json.loads(payload)["choices"] if c.get("finish_reason")
+                ]
+        (final,) = finals
+        assert final.get("kv_versions", "unset") == (expected if opt_in else "unset")
+    else:
+        response = await serving.chat_completion_full_generator(
+            request,
+            _single_request_output(request_output),
+            "chatcmpl-test-id",
+            "test-model",
+            **kwargs,
+        )
+        assert not isinstance(response, ErrorResponse)
+        got = response.model_dump()["choices"][0]["kv_versions"]
+        assert got == (expected if opt_in else None)

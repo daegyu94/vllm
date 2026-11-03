@@ -24,7 +24,12 @@ from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.exceptions import GenerationError, VLLMValidationError
 from vllm.logprobs import Logprob
-from vllm.outputs import CompletionOutput, RequestOutput, WeightVersionSpan
+from vllm.outputs import (
+    CompletionOutput,
+    KVVersionSpan,
+    RequestOutput,
+    WeightVersionSpan,
+)
 from vllm.renderers.deepseek_v4 import DeepseekV4Renderer
 from vllm.renderers.hf import HfRenderer
 from vllm.renderers.online_renderer import OnlineRenderer
@@ -365,12 +370,21 @@ def test_completion_metrics_carries_both_timing_and_spec_decode():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("opt_in", [False, True])
-async def test_completion_weight_versions(stream: bool, opt_in: bool):
+@pytest.mark.parametrize(
+    "field,span_cls,expected",
+    [
+        ("weight_versions", WeightVersionSpan, {"version": "v1", "start": 0, "end": 2}),
+        ("kv_versions", KVVersionSpan, {"floor": "v0", "start": 0, "end": 2}),
+    ],
+)
+async def test_completion_version_spans(
+    stream: bool, opt_in: bool, field: str, span_cls: type, expected: dict
+):
     """Each choice gets its spans on its final output, even with no tokens."""
-    expected = [{"version": "v1", "start": 0, "end": 2}]
-    spans = [WeightVersionSpan(**span) for span in expected]
+    spans = [span_cls(**expected)]
+    expected = [expected]
 
-    def output(index, token_ids, finish_reason=None, weight_versions=None):
+    def output(index, token_ids, finish_reason=None, version_spans=None):
         return CompletionOutput(
             index=index,
             text="x" * len(token_ids),
@@ -378,7 +392,7 @@ async def test_completion_weight_versions(stream: bool, opt_in: bool):
             cumulative_logprob=None,
             logprobs=None,
             finish_reason=finish_reason,
-            weight_versions=weight_versions,
+            **{field: version_spans},
         )
 
     # Choice 1 is aborted before its first token.
@@ -411,7 +425,7 @@ async def test_completion_weight_versions(stream: bool, opt_in: bool):
         max_tokens=10,
         n=2,
         stream=stream,
-        return_weight_versions=opt_in,
+        **{f"return_{field}": opt_in},
     )
     response = await _build_serving_completion(mock_engine).create_completion(request)
 
@@ -426,12 +440,18 @@ async def test_completion_weight_versions(stream: bool, opt_in: bool):
                 if choice.get("finish_reason"):
                     finals[choice["index"]] = choice
                 else:
-                    assert choice.get("weight_versions") is None
-        got = [finals[i].get("weight_versions") for i in (0, 1)]
+                    assert choice.get(field) is None
+        got = [finals[i].get(field, "unset") for i in (0, 1)]
     else:
         assert isinstance(response, CompletionResponse)
-        got = [choice["weight_versions"] for choice in response.model_dump()["choices"]]
-    assert got == ([expected, []] if opt_in else [None, None])
+        got = [choice[field] for choice in response.model_dump()["choices"]]
+    if opt_in:
+        assert got == [expected, []]
+    elif stream and field == "kv_versions":
+        # Opted-out chunks stay as before; weight_versions predates this.
+        assert got == ["unset", "unset"]
+    else:
+        assert got == [None, None]
 
 
 def _build_online_renderer_for_completion(

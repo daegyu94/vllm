@@ -40,7 +40,7 @@ from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel, UsageInfo
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
-from vllm.outputs import WeightVersionSpan
+from vllm.outputs import KVVersionSpan, WeightVersionSpan
 from vllm.renderers import (
     ChatParams,
     ReasoningEffort,
@@ -140,6 +140,7 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     routed_experts: str | None = None
     # Contiguous weight version spans over output-token indexes.
     weight_versions: list[WeightVersionSpan] | None = None
+    kv_versions: list[KVVersionSpan] | None = None
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -181,6 +182,7 @@ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
     token_ids: list[int] | None = None
     # Set on the final chunk only; covers the whole output.
     weight_versions: list[WeightVersionSpan] | None = None
+    kv_versions: list[KVVersionSpan] | None = None
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):
@@ -452,6 +454,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "label that sampled each half-open range of its output tokens. "
             "When streaming, only the last chunk of each choice includes it. "
             "Beam search does not return it."
+        ),
+    )
+    return_kv_versions: bool = Field(
+        default=False,
+        description=(
+            "If true and the server runs with --kv-weight-provenance, each "
+            "choice includes kv_versions: for each half-open range of its "
+            "output tokens, the weight-version label of the oldest KV those "
+            "tokens attended to, or null if unknown. When streaming, only the "
+            "last chunk of each choice includes it. Beam search does not "
+            "return it."
         ),
     )
     routed_experts_prompt_start: int = Field(

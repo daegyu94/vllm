@@ -458,6 +458,12 @@ class OpenAIServingCompletion(GenerateBaseServing):
                                     if request.return_weight_versions
                                     else None
                                 ),
+                                # Unset unless opted in, so other chunks stay unchanged.
+                                **(
+                                    {"kv_versions": output.kv_versions}
+                                    if request.return_kv_versions
+                                    else {}
+                                ),
                             )
                         ],
                         kv_transfer_params=(
@@ -651,6 +657,12 @@ class OpenAIServingCompletion(GenerateBaseServing):
                         output.weight_versions
                         if request.return_weight_versions
                         else None
+                    ),
+                    # Unset unless opted in, so other chunks stay unchanged.
+                    **(
+                        {"kv_versions": output.kv_versions}
+                        if request.return_kv_versions
+                        else {}
                     ),
                 )
                 choices.append(choice_data)

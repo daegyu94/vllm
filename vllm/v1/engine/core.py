@@ -212,6 +212,7 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
+        self.scheduler.set_weight_epoch(self._weight_epoch, self._weight_version)
         self._initialize_effective_attention_block_size()
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
@@ -1239,7 +1240,7 @@ class EngineCore:
     def set_weight_version(self, weight_version: str) -> None:
         if weight_version != self._weight_version:
             self._check_weights_may_change()
-            self._new_weight_epoch()
+            self._new_weight_epoch(weight_version)
         self._weight_version = weight_version
 
     def finish_weight_update(self, weight_version: str | None = None) -> None:
@@ -1248,12 +1249,19 @@ class EngineCore:
         self._check_weights_may_change()
         try:
             self.model_executor.collective_rpc("finish_weight_update")
-        finally:
+        except BaseException:
             # A failed update may have changed some weights already; a new
             # epoch can only make KV records older than exact.
-            self._new_weight_epoch()
+            self._new_weight_epoch(self._weight_version)
+            raise
         if weight_version is not None:
             self._weight_version = weight_version
+        elif self._kv_weight_provenance:
+            logger.warning_once(
+                "finish_weight_update without a weight_version: kv_versions "
+                "reports the new weights under the previous label."
+            )
+        self._new_weight_epoch(self._weight_version)
 
     def _check_weights_may_change(self) -> None:
         # Each scheduled step must run under one epoch: running requests
@@ -1269,9 +1277,9 @@ class EngineCore:
                 'pause_generation(mode="keep"), or while nothing runs.'
             )
 
-    def _new_weight_epoch(self) -> None:
+    def _new_weight_epoch(self, weight_version: str) -> None:
         self._weight_epoch += 1
-        self.scheduler.set_weight_epoch(self._weight_epoch)
+        self.scheduler.set_weight_epoch(self._weight_epoch, weight_version)
 
     def get_weight_version(self) -> str:
         """Return the latest committed weight version."""

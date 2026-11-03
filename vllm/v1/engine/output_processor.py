@@ -14,6 +14,7 @@ from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
     CompletionOutput,
+    KVVersionSpan,
     PoolingOutput,
     PoolingRequestOutput,
     RequestError,
@@ -30,7 +31,12 @@ from vllm.tracing import (
     instrument_manual,
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+from vllm.v1.engine import (
+    EngineCoreOutput,
+    EngineCoreRequest,
+    FinishReason,
+    KVFloor,
+)
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -240,6 +246,8 @@ class RequestState:
         self.sampling_mask_chunks: list[SamplingMaskLists] = []
         # (weight version, first output-token index) for each span.
         self.weight_version_starts: list[tuple[str, int]] = []
+        # (KV floor, first output-token index) for each span.
+        self.kv_floor_starts: list[tuple[KVFloor, int]] = []
 
         # Stream Interval
         self.stream_interval = stream_interval
@@ -526,6 +534,7 @@ class RequestState:
             stop_reason=stop_reason if finished else None,
             spec_decode_metrics=self.spec_decode_metrics if finished else None,
             weight_versions=self._weight_version_spans() if finished else None,
+            kv_versions=self._kv_version_spans() if finished else None,
         )
 
     def track_weight_version(self, weight_version: str) -> None:
@@ -543,6 +552,25 @@ class RequestState:
             return None  # No label was reported for these tokens.
         ends = [start for _, start in starts[1:]] + [num_tokens]
         return [WeightVersionSpan(v, s, e) for (v, s), e in zip(starts, ends)]
+
+    def track_kv_floor(self, kv_floor: KVFloor) -> None:
+        """Start a span when the floor of the attended KV changes."""
+        assert self.detokenizer is not None
+        starts = self.kv_floor_starts
+        if not starts or starts[-1][0] != kv_floor:
+            starts.append((kv_floor, self.detokenizer.num_output_tokens()))
+
+    def _kv_version_spans(self) -> list[KVVersionSpan] | None:
+        starts = self.kv_floor_starts
+        if not starts:
+            return None  # Not tracked (kv_weight_provenance off).
+        assert self.detokenizer is not None
+        ends = [start for _, start in starts[1:]] + [
+            self.detokenizer.num_output_tokens()
+        ]
+        return [
+            KVVersionSpan(floor.version, s, e) for (floor, s), e in zip(starts, ends)
+        ]
 
     def _new_pooling_output(self, pooling_output: torch.Tensor) -> PoolingOutput:
         return PoolingOutput(data=pooling_output)
@@ -820,6 +848,8 @@ class OutputProcessor:
                 assert req_state.logprobs_processor is not None
                 if new_token_ids and weight_version is not None:
                     req_state.track_weight_version(weight_version)
+                if engine_core_output.kv_floor is not None:
+                    req_state.track_kv_floor(engine_core_output.kv_floor)
                 # 2) Detokenize the token ids into text and perform stop checks.
                 num_prev_tokens = req_state.detokenizer.num_output_tokens()
                 stop_string = req_state.detokenizer.update(

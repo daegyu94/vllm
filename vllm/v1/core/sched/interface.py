@@ -217,8 +217,9 @@ class SchedulerInterface(ABC):
     def set_pause_state(self, pause_state: PauseState) -> None:
         raise NotImplementedError
 
-    def set_weight_epoch(self, weight_epoch: int) -> None:
-        """Set the epoch of the current weights (kv_weight_provenance)."""
+    def set_weight_epoch(self, weight_epoch: int, weight_version: str) -> None:
+        """Set the epoch of the current weights and its version label
+        (kv_weight_provenance)."""
         return
 
     @abstractmethod

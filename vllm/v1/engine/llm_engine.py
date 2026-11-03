@@ -502,6 +502,9 @@ class LLMEngine:
     def set_weight_version(self, weight_version: str) -> None:
         self.engine_core.set_weight_version(weight_version)
 
+    def finish_weight_update(self, weight_version: str | None = None) -> None:
+        self.engine_core.finish_weight_update(weight_version)
+
     def get_weight_version(self) -> str:
         """Return the latest committed weight version."""
         return self.engine_core.get_weight_version()

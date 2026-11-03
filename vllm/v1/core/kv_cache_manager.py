@@ -147,6 +147,7 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
+        track_kv_weight_epochs: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -156,6 +157,15 @@ class KVCacheManager:
             max_in_flight_tokens = max_model_len
 
         self.enable_caching = enable_caching
+        self.track_kv_weight_epochs = track_kv_weight_epochs
+        # Epoch of the current weights; set by the scheduler.
+        self.weight_epoch = 0
+        # SWA bounded replay rewinds over KV that only some groups rewrite,
+        # so a request's floor can't be tracked there: report it unknown.
+        self._kv_floor_unknown = any(
+            g.kv_cache_spec.prefix_replay_tokens > 0
+            for g in kv_cache_config.kv_cache_groups
+        )
         self.enable_kv_cache_events = enable_kv_cache_events
         self.use_eagle = use_eagle
         self.log_stats = log_stats
@@ -586,6 +596,13 @@ class KVCacheManager:
             # Cannot allocate new blocks
             return None
 
+        # Admission, or re-admission after preemption; a rewind keeps the
+        # floor, which can only be older than exact.
+        if self.track_kv_weight_epochs and request.num_computed_tokens == 0:
+            request.kv_floor_epoch = self._admission_kv_floor(
+                new_computed_block_list, num_external_computed_tokens
+            )
+
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
             or num_external_computed_tokens > 0
@@ -781,6 +798,27 @@ class KVCacheManager:
             )
 
         return cached_tokens or 0
+
+    def _admission_kv_floor(
+        self,
+        hit_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_external_computed_tokens: int,
+    ) -> int | None:
+        """Oldest weight epoch over the KV an admitted request starts from.
+
+        Tokens computed later use the current or a newer epoch, so this stays
+        the request's floor until it is preempted and re-admitted.
+        """
+        if self._kv_floor_unknown or num_external_computed_tokens:
+            return None
+        floor = self.weight_epoch
+        for blocks in hit_blocks:
+            # Every hit block counts: duplicates of one prefix can differ.
+            floors = {blk.floor_epoch for blk in blocks if not blk.is_null}
+            if None in floors:
+                return None
+            floor = min([floor, *(f for f in floors if f is not None)])
+        return floor
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled.

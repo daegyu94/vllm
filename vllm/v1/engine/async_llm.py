@@ -1452,9 +1452,7 @@ class AsyncLLM(EngineClient):
 
     async def finish_weight_update(self, weight_version: str | None = None) -> None:
         """Finish the weight update and set its version if provided."""
-        await self.collective_rpc("finish_weight_update")
-        if weight_version is not None:
-            await self.update_weight_version(weight_version)
+        await self.engine_core.finish_weight_update_async(weight_version)
 
     async def update_weight_version(self, new_version: str) -> None:
         """Set the weight version without updating weights."""

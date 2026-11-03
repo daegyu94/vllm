@@ -35,6 +35,7 @@ def _replay_scheduler(
     *,
     long_prefill_token_threshold: int = 0,
     use_kv_connector: MockKVConfig | str | None = None,
+    kv_weight_provenance: bool = False,
 ) -> Scheduler:
     """A hybrid layout: one prefix-cacheable full-attention group and one
     replayed sliding-window group."""
@@ -43,6 +44,7 @@ def _replay_scheduler(
         enable_prefix_caching=True,
         long_prefill_token_threshold=long_prefill_token_threshold,
         use_kv_connector=use_kv_connector,
+        kv_weight_provenance=kv_weight_provenance,
     )
     vllm_config = base.vllm_config
     kv_cache_config = KVCacheConfig(
@@ -369,3 +371,19 @@ def test_kv_load_zeroing_respects_loaded_groups(is_async, loads_window):
             assert not new_ids & zeroed
         else:
             assert new_ids <= zeroed
+
+
+def test_replay_reports_unknown_kv_floor():
+    """Replay rewinds over KV that only some groups rewrite, which a request's
+    floor cannot express, so it is unknown on replay models."""
+    scheduler = _replay_scheduler(kv_weight_provenance=True)
+    first, second = create_requests(
+        num_requests=2,
+        num_tokens=NUM_PROMPT_TOKENS,
+        same_prompt=True,
+        block_size=BLOCK_SIZE,
+    )
+    _prefill(scheduler, first)
+    scheduler.add_request(second)
+    scheduler.schedule()
+    assert first.kv_floor_epoch is None and second.kv_floor_epoch is None

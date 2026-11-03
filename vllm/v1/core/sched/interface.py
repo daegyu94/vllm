@@ -217,6 +217,10 @@ class SchedulerInterface(ABC):
     def set_pause_state(self, pause_state: PauseState) -> None:
         raise NotImplementedError
 
+    def set_weight_epoch(self, weight_epoch: int) -> None:
+        """Set the epoch of the current weights (kv_weight_provenance)."""
+        return
+
     @abstractmethod
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

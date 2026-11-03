@@ -89,6 +89,12 @@ The offsets cover the whole output, so with streamed delta outputs, collect the 
 
 An aborted request returns spans over its partial output. If you resubmit that output as part of a new prompt, the new request's spans start again at 0, so shift them by the number of tokens already generated before joining the two lists.
 
+## KV Weight Provenance
+
+`weight_versions` names the weights that sampled each token, not the weights that computed the KV it attended to. These differ when a request is kept across an update with `clear_cache=False`, or when its prompt hits prefix-cache blocks computed before an update. With `--kv-weight-provenance`, vLLM numbers the weights with an epoch that grows on every `finish_weight_update` and every weight-version label change, records on each prefix-cache block the oldest epoch its KV depends on, and tracks the oldest epoch each request reads.
+
+Weights may then only change while running requests are frozen by `pause_generation(mode="keep")`, or while nothing runs; the weight update calls and `update_weight_version` raise otherwise. Under data parallelism each engine checks this on its own, so pause every engine before updating. A failed update still starts an epoch, since it may have changed some weights. `collective_rpc("finish_weight_update")`, `collective_rpc("reload_weights")` and `collective_rpc("reset_weights")` are refused, as they would change weights without an epoch; weight changes through a worker extension aren't tracked unless you also set a new label. KV loaded by a KV connector, and models with sliding-window bounded replay (DeepSeek-V4.1), have an unknown epoch.
+
 ## Example
 
 The [async RLHF example](../../examples/rl/rlhf_async_new_apis.py) demonstrates this pattern with `vllm.AsyncLLMEngine`, NCCL weight transfer, and mid-flight pause/resume with validation.

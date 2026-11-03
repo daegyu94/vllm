@@ -366,6 +366,7 @@ class Scheduler(SchedulerInterface):
             enable_mamba_shared_prefix_checkpoint=(
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
+            track_kv_weight_epochs=self.cache_config.kv_weight_provenance,
         )
         # Mamba managers already account for their speculative state blocks.
         num_spec_decode_tokens = (
@@ -3077,6 +3078,9 @@ class Scheduler(SchedulerInterface):
     def set_pause_state(self, pause_state: PauseState) -> None:
         logger.info("setting pause state to %s", pause_state.name)
         self._pause_state = pause_state
+
+    def set_weight_epoch(self, weight_epoch: int) -> None:
+        self.kv_cache_manager.weight_epoch = weight_epoch
 
     def _request_blocks_can_be_freed(self, request: Request) -> bool:
         # We must defer freeing blocks if an async kv connector may

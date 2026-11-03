@@ -6711,3 +6711,94 @@ def test_get_unhashed_block_ids_all_groups():
     )
 
     assert blocks.get_unhashed_block_ids_all_groups() == [[1, 4], []]
+
+
+def _floor_manager(num_blocks: int = 11, track: bool = True) -> KVCacheManager:
+    return make_kv_cache_manager(
+        make_kv_cache_config(16, num_blocks),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=16,
+        track_kv_weight_epochs=track,
+    )
+
+
+def _cached_floors(manager: KVCacheManager, req: Request) -> list[int | None]:
+    return [
+        blk.floor_epoch
+        for blk in manager.coordinator.get_blocks(req.request_id)[0]
+        if blk.block_hash is not None
+    ]
+
+
+def test_kv_floor_set_on_admission_and_kept_by_hits():
+    """A request's floor is the oldest epoch it reads: its hits' floors or the
+    epoch it was admitted at; blocks it caches carry that floor."""
+    manager = _floor_manager()
+    manager.weight_epoch = 2
+    common = list(range(48))
+    req0 = make_request("0", common + [100] * 7, 16, sha256)
+    manager.allocate_slots(req0, 55)
+    assert req0.kv_floor_epoch == 2
+    assert _cached_floors(manager, req0) == [2, 2, 2]
+
+    manager.weight_epoch = 3
+    req1 = make_request("1", common + [200] * 16, 16, sha256)
+    hit, num_hit, _ = manager.get_computed_blocks(req1)
+    assert num_hit == 48
+    manager.allocate_slots(req1, 16, num_hit, hit)
+    assert req1.kv_floor_epoch == 2
+    assert _cached_floors(manager, req1) == [2, 2, 2, 2]
+
+    req2 = make_request("2", list(range(500, 532)), 16, sha256)
+    manager.allocate_slots(req2, 32)
+    assert req2.kv_floor_epoch == 3
+
+
+def test_kv_floor_unknown_after_connector_load():
+    manager = _floor_manager()
+    req0 = make_request("0", list(range(48)), 16, sha256)
+    manager.allocate_slots(req0, 16, num_external_computed_tokens=32)
+    assert req0.kv_floor_epoch is None
+    assert _cached_floors(manager, req0) == [None, None, None]
+
+    # The unknown floor carries through a prefix hit on those blocks.
+    req1 = make_request("1", list(range(48)) + [7] * 16, 16, sha256)
+    hit, num_hit, _ = manager.get_computed_blocks(req1)
+    manager.allocate_slots(req1, 16, num_hit, hit)
+    assert req1.kv_floor_epoch is None
+
+
+def test_kv_floor_cleared_with_block_hash():
+    manager = _floor_manager(num_blocks=3)
+    manager.weight_epoch = 1
+    req0 = make_request("0", list(range(32)), 16, sha256)
+    manager.allocate_slots(req0, 32)
+    manager.free(req0)
+    req1 = make_request("1", list(range(100, 116)), 16, sha256)
+    manager.allocate_slots(req1, 15)  # evicts a cached block, keeps it partial
+    (blk,) = manager.coordinator.get_blocks(req1.request_id)[0]
+    assert blk.block_hash is None and blk.floor_epoch is None
+    manager.free(req1)
+    assert manager.reset_prefix_cache()
+    assert all(blk.floor_epoch is None for blk in manager.block_pool.blocks)
+
+
+def test_kv_floor_not_tracked_by_default():
+    manager = _floor_manager(track=False)
+    manager.weight_epoch = 4
+    req = make_request("0", list(range(32)), 16, sha256)
+    manager.allocate_slots(req, 32)
+    assert req.kv_floor_epoch is None
+    assert _cached_floors(manager, req) == [None, None]
+
+
+def test_kv_floor_moves_with_block_hashes():
+    manager = _floor_manager()
+    manager.weight_epoch = 4
+    req = make_request("0", list(range(16)), 16, sha256)
+    manager.allocate_slots(req, 16)
+    (src,) = manager.coordinator.get_blocks(req.request_id)[0]
+    (dst,) = manager.block_pool.get_new_blocks(1)
+    manager.block_pool.move_block_hashes(src, dst)
+    assert (src.floor_epoch, dst.floor_epoch) == (None, 4)

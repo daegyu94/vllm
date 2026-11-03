@@ -301,6 +301,8 @@ class BlockPool:
                 blk,
                 num_tokens=num_hash_tokens,
             )
+            # Its prefix is the request's hits plus tokens computed since.
+            blk.floor_epoch = request.kv_floor_epoch
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -558,6 +560,8 @@ class BlockPool:
             block,
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
+        if block.block_hash == block_hash_with_group_id:
+            block.floor_epoch = request.kv_floor_epoch
         if self.enable_kv_cache_events and not already_cached:
             parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
                 request, num_tokens
@@ -701,9 +705,11 @@ class BlockPool:
         assert dst_block.block_hash is None
         assert dst_block.block_id not in self.cached_block_hashes_by_block
         num_tokens = src_block.block_hash_num_tokens
+        floor_epoch = src_block.floor_epoch
         for block_hash in self._remove_cached_block_hashes(src_block):
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
+        dst_block.floor_epoch = floor_epoch
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.

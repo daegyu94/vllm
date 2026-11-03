@@ -400,6 +400,12 @@ class CacheConfig:
     to None, which means no KV offloading is enabled. When set, vLLM will
     enable KV cache offloading to CPU using the kv_offloading_backend."""
 
+    kv_weight_provenance: bool = False
+    """Record which weights computed each prefix-cache block, as an epoch that
+    grows on every weight update and weight-version label change, and the
+    oldest such epoch each request reads (its KV floor). For async RL with
+    pause(mode="keep"); weight updates must then happen while paused."""
+
     kv_offloading_backend: KVOffloadingBackend = "native"
     """The backend to use for KV cache offloading. Supported backends include
     'native' (vLLM native CPU offloading), 'lmcache'.
@@ -425,6 +431,7 @@ class CacheConfig:
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
             "prefix_cache_retention_interval",
+            "kv_weight_provenance",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
             "enable_mamba_shared_prefix_checkpoint",

@@ -8877,3 +8877,98 @@ def test_cpu_encoder_input_updates_preserve_shm_handles(use_v2_model_runner):
         {request.request_id: {1: None}} if use_v2_model_runner else {}
     )
     assert request.mm_features[0].data is handle
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_kv_floor_across_keep_pause_and_cache_reset(async_scheduling):
+    """A request kept across a weight update keeps the old floor on every block
+    it caches; pause(clear_cache=True) recomputes it under the new weights."""
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        async_scheduling=async_scheduling,
+        kv_weight_provenance=True,
+    )
+    (req,) = create_requests(1, num_tokens=40, max_tokens=100, ignore_eos=True)
+    scheduler.add_request(req)
+
+    def step():
+        output = scheduler.schedule()
+        scheduler.update_from_output(output, make_output(scheduler))
+
+    def cached_floors():
+        blocks = scheduler.kv_cache_manager.coordinator.get_blocks(req.request_id)
+        return [b.floor_epoch for b in blocks[0] if b.block_hash is not None]
+
+    step()
+    scheduler.set_pause_state(PauseState.PAUSED_ALL)
+    scheduler.set_weight_epoch(1)
+    scheduler.set_pause_state(PauseState.UNPAUSED)
+    while req.num_computed_tokens < 64:
+        step()
+    assert req.kv_floor_epoch == 0
+    assert cached_floors() == [0, 0, 0, 0]
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    step()
+    assert req.kv_floor_epoch == 1
+    assert set(cached_floors()) == {1}
+
+
+def _weight_epoch_core(kv_weight_provenance: bool = True) -> EngineCore:
+    core = object.__new__(EngineCore)
+    core.scheduler = create_scheduler(
+        enable_prefix_caching=True, kv_weight_provenance=kv_weight_provenance
+    )
+    core.model_executor = Mock()
+    core._weight_version = "default"
+    core._weight_epoch = 0
+    core._kv_weight_provenance = kv_weight_provenance
+    return core
+
+
+def test_weight_epoch_grows_on_weight_updates_and_label_changes():
+    core = _weight_epoch_core()
+    epoch = lambda: core.scheduler.kv_cache_manager.weight_epoch  # noqa: E731
+    core.set_weight_version("v1")
+    core.set_weight_version("v1")
+    assert epoch() == 1
+    core.finish_weight_update("v2")
+    assert (epoch(), core.get_weight_version()) == (2, "v2")
+    core.finish_weight_update()
+    assert (epoch(), core.get_weight_version()) == (3, "v2")
+    # A failed update may have changed some weights: start an epoch anyway.
+    core.model_executor.collective_rpc.side_effect = RuntimeError("load failed")
+    with pytest.raises(RuntimeError, match="load failed"):
+        core.finish_weight_update("v3")
+    assert (epoch(), core.get_weight_version()) == (4, "v2")
+
+
+@pytest.mark.parametrize("kv_weight_provenance", [True, False])
+def test_weight_change_with_running_requests_needs_keep_pause(kv_weight_provenance):
+    """With provenance, weights may only change while running requests are
+    frozen, so each scheduled step runs under one epoch."""
+    core = _weight_epoch_core(kv_weight_provenance)
+    core.scheduler.add_request(create_requests(1)[0])
+    core.scheduler.schedule()
+    if kv_weight_provenance:
+        with pytest.raises(RuntimeError, match="pause_generation"):
+            core.finish_weight_update("v1")
+        with pytest.raises(RuntimeError, match="pause_generation"):
+            core.set_weight_version("v1")
+        with pytest.raises(RuntimeError, match="pause_generation"):
+            core.collective_rpc("update_weights")
+        core.model_executor.collective_rpc.assert_not_called()
+    core.scheduler.set_pause_state(PauseState.PAUSED_ALL)
+    core.finish_weight_update("v1")
+    assert core.get_weight_version() == "v1"
+
+
+def test_untracked_weight_rpcs_refused_with_provenance():
+    """Weight changes that bypass finish_weight_update would not advance the
+    epoch, so they are refused while provenance is on."""
+    core = _weight_epoch_core()
+    for method in ("finish_weight_update", "reload_weights", "reset_weights"):
+        with pytest.raises(RuntimeError, match="not supported"):
+            core.collective_rpc(method)
+    core.model_executor.collective_rpc.assert_not_called()
+    _weight_epoch_core(kv_weight_provenance=False).collective_rpc("reset_weights")

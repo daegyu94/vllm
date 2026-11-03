@@ -858,6 +858,7 @@ class EngineArgs:
 
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
+    kv_weight_provenance: bool = CacheConfig.kv_weight_provenance
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
@@ -1463,6 +1464,9 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
+        )
+        cache_group.add_argument(
+            "--kv-weight-provenance", **cache_kwargs["kv_weight_provenance"]
         )
 
         # Model weight offload related configs
@@ -2340,6 +2344,7 @@ class EngineArgs:
             use_replayssm=self.use_replayssm,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            kv_weight_provenance=self.kv_weight_provenance,
         )
 
         # TurboQuant and UltraQuant both keep boundary attention layers at the

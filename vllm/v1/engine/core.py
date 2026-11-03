@@ -124,6 +124,16 @@ HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
 
+# Worker RPCs that change the target weights without advancing the weight
+# epoch; refused with kv_weight_provenance (see finish_weight_update).
+_UNTRACKED_WEIGHT_RPCS = frozenset(
+    {"finish_weight_update", "reload_weights", "reset_weights"}
+)
+# Worker RPCs of a weight update session, allowed only while paused.
+_WEIGHT_UPDATE_RPCS = frozenset(
+    {"start_weight_update", "start_draft_weight_update", "update_weights"}
+)
+
 
 class EngineCore:
     """Inner loop of vLLM's Engine."""
@@ -158,6 +168,9 @@ class EngineCore:
         self.log_stats = log_stats
         # Opaque weight version supplied by the caller.
         self._weight_version = "default"
+        # Grows on every weight update and label change (kv_weight_provenance).
+        self._weight_epoch = 0
+        self._kv_weight_provenance = vllm_config.cache_config.kv_weight_provenance
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -1212,10 +1225,53 @@ class EngineCore:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
+        if self._kv_weight_provenance and isinstance(method, str):
+            if method in _UNTRACKED_WEIGHT_RPCS:
+                raise RuntimeError(
+                    f'collective_rpc("{method}") is not supported with '
+                    "kv_weight_provenance; use finish_weight_update, which "
+                    "advances the KV weight epoch."
+                )
+            if method in _WEIGHT_UPDATE_RPCS:
+                self._check_weights_may_change()
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
 
     def set_weight_version(self, weight_version: str) -> None:
+        if weight_version != self._weight_version:
+            self._check_weights_may_change()
+            self._new_weight_epoch()
         self._weight_version = weight_version
+
+    def finish_weight_update(self, weight_version: str | None = None) -> None:
+        """Finish the workers' weight update session and start a new weight
+        epoch, labelled `weight_version` if given."""
+        self._check_weights_may_change()
+        try:
+            self.model_executor.collective_rpc("finish_weight_update")
+        finally:
+            # A failed update may have changed some weights already; a new
+            # epoch can only make KV records older than exact.
+            self._new_weight_epoch()
+        if weight_version is not None:
+            self._weight_version = weight_version
+
+    def _check_weights_may_change(self) -> None:
+        # Each scheduled step must run under one epoch: running requests
+        # must be frozen by pause(mode="keep").
+        if (
+            self._kv_weight_provenance
+            and self.scheduler.pause_state != PauseState.PAUSED_ALL
+            and self.scheduler.get_request_counts()[0] > 0
+        ):
+            raise RuntimeError(
+                "With kv_weight_provenance, weights and their version can "
+                "only change while running requests are frozen by "
+                'pause_generation(mode="keep"), or while nothing runs.'
+            )
+
+    def _new_weight_epoch(self) -> None:
+        self._weight_epoch += 1
+        self.scheduler.set_weight_epoch(self._weight_epoch)
 
     def get_weight_version(self) -> str:
         """Return the latest committed weight version."""

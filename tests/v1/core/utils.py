@@ -93,6 +93,7 @@ def create_scheduler(
     scheduler_cls: type[Scheduler] | None = None,
     lora_config: LoRAConfig | None = None,
     speculative_config: SpeculativeConfig | None = None,
+    kv_weight_provenance: bool = False,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -150,6 +151,7 @@ def create_scheduler(
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
         enable_prefix_caching=enable_prefix_caching,
+        kv_weight_provenance=kv_weight_provenance,
     )
     kv_transfer_config = None
     if isinstance(use_kv_connector, MockKVConfig):

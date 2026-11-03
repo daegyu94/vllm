@@ -55,9 +55,7 @@ class RLOfflineMixin(OfflineInferenceMixin):
 
     def finish_weight_update(self, weight_version: str | None = None) -> None:
         """Finish the weight update and set its version if provided."""
-        self.llm_engine.collective_rpc("finish_weight_update")
-        if weight_version is not None:
-            self.llm_engine.set_weight_version(weight_version)
+        self.llm_engine.finish_weight_update(weight_version)
 
     def update_weight_version(self, new_version: str) -> None:
         """Set the weight version without updating weights."""

@@ -178,6 +178,9 @@ class KVCacheBlock:
     # Number of prefix tokens covered by _block_hash. For full blocks this is
     # the full block boundary; partial entries can end inside a cache block.
     _block_hash_num_tokens: int | None = None
+    # Oldest weight epoch over the KV of the whole prefix up to and including
+    # this block, set when cached with kv_weight_provenance; None if unknown.
+    floor_epoch: int | None = None
 
     # Used to construct a doubly linked list for free blocks.
     # These two attributes should only be manipulated by FreeKVCacheBlockQueue.
@@ -210,6 +213,7 @@ class KVCacheBlock:
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
         self._block_hash_num_tokens = None
+        self.floor_epoch = None
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__

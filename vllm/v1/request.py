@@ -183,6 +183,9 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # Oldest weight epoch over the KV this request reads; set on admission
+        # with kv_weight_provenance. Epochs only grow, so later steps keep it.
+        self.kv_floor_epoch: int | None = None
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related
